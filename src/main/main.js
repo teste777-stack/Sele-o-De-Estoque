@@ -182,9 +182,24 @@ function createWindow() {
   });
 }
 
+// Impede múltiplas instâncias na MESMA pasta de dados. Duas instâncias juntas
+// não conseguem travar o cache de rede (erro "Acesso negado / Unable to create
+// cache") e o protocolo ycimg:// passa a falhar com "Failed to fetch", deixando
+// as capas em branco. Se já houver uma aberta, foca nela e encerra esta.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
 app.whenReady().then(() => {
   storage = new Storage(app.getPath('userData'));
-
   // Pasta do cache local de imagens (arquivo permanente das fotos).
   imageCacheDir = path.join(app.getPath('userData'), 'image-cache');
   try {
