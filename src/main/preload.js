@@ -46,6 +46,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Precos dos links de compra
   fetchPrices: (urls) => invoke('links:fetchPrices', urls),
   cancelLoading: () => invoke('loading:cancel'),
+  getCachedPrices: (urls) => invoke('prices:getCached', urls),
   pricesFromTitles: (items) => invoke('prices:fromTitles', items),
   onPriceProgress: (cb) => {
     const listener = (_e, payload) => cb(payload);

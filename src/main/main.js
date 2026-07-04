@@ -387,6 +387,18 @@ ipcMain.handle(
 );
 
 /**
+ * Retorna os precos JA ARMAZENADOS (independente da idade) para uma lista de
+ * urls, para exibicao instantanea sem rebuscar.
+ */
+ipcMain.handle(
+  'prices:getCached',
+  wrap(async (urls) => {
+    const list = Array.isArray(urls) ? urls.filter(Boolean) : [];
+    return storage.getStoredPrices(list);
+  })
+);
+
+/**
  * Detecta precos escritos no NOME do album (ex.: ￥98, ¥239).
  * Recebe [{id, title, url}] e retorna { [id]: {price,currency,usd,brl,ok,source,url} }.
  */

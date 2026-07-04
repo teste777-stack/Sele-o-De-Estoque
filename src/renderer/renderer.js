@@ -371,6 +371,19 @@ async function maybeCheckLinks() {
   }
 
   const priceLinks = [];
+  // Carrega do disco (cache que nao expira p/ exibicao) os precos ja obtidos,
+  // para mostrar na hora sem rebuscar.
+  const allLinks = Object.keys(map)
+    .map((id) => (map[id].externalLinks || [])[0])
+    .filter(Boolean);
+  if (allLinks.length) {
+    try {
+      const stored = await callQuiet(api.getCachedPrices([...new Set(allLinks)]), 'Cache preços');
+      Object.assign(state.prices, stored || {});
+    } catch (_) {
+      /* segue sem cache */
+    }
+  }
   for (const id of Object.keys(map)) {
     const info = map[id];
     const badge = document.querySelector(`[data-badge="${CSS.escape(id)}"]`);
@@ -393,9 +406,9 @@ async function maybeCheckLinks() {
     if (priceEl) {
       if (link) {
         priceEl.dataset.link = link;
-        // Se ja temos em cache, mostra na hora; senao marca como carregando.
+        // Se ja temos armazenado (ok ou falha), mostra na hora e NAO rebusca.
         const cached = state.prices[link];
-        if (cached && cached.ok && cached.price != null) {
+        if (cached) {
           updateAlbumPrice(link);
         } else {
           priceEl.className = 'price-badge loading';
@@ -882,6 +895,19 @@ async function renderFavGrid() {
 
   // Preços automáticos nos favoritos (usa o primeiro link de cada favorito).
   const favLinks = [];
+  // Carrega do disco os precos ja obtidos, para exibir na hora sem rebuscar.
+  const allFavLinks = visible.map((f) => (f.externalLinks || [])[0]).filter(Boolean);
+  if (allFavLinks.length) {
+    try {
+      const stored = await callQuiet(
+        api.getCachedPrices([...new Set(allFavLinks)]),
+        'Cache preços'
+      );
+      Object.assign(state.prices, stored || {});
+    } catch (_) {
+      /* segue sem cache */
+    }
+  }
   visible.forEach((f) => {
     const key = favKey(f.store, f.albumId);
     const link = (f.externalLinks || [])[0];
@@ -890,7 +916,7 @@ async function renderFavGrid() {
     if (link) {
       el.dataset.link = link;
       const cached = state.prices[link];
-      if (cached && cached.ok && cached.price != null) {
+      if (cached) {
         updateAlbumPrice(link);
       } else {
         el.className = 'price-badge loading';

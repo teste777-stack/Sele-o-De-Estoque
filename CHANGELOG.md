@@ -25,6 +25,10 @@ Registro do que funciona e das atualizações. Formato baseado em
 ### Corrigido
 - Seen não persistia quando `recordSeen` rodava após `renderPager`.
 - Corrida de gravação concorrente que podia descartar escritas no cache.
+- **Preços sumindo / voltando a "pendente" após reiniciar**: o cache expirava em
+  24h e a exibição dependia de rebuscar a cada carregamento. Agora os preços
+  salvos são lidos do disco (`getStoredPrices` / `prices:getCached`) e exibidos
+  na hora; só são buscados os links que nunca foram consultados.
 
 ### Removido / Bloqueado
 - **Taobao/Tmall** deixaram de ser acessados (retornam como "ignorado").

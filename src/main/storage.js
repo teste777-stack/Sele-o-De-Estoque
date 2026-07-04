@@ -466,6 +466,31 @@ class Storage {
     await this._savePrices();
   }
 
+  /**
+   * Retorna o preco ARMAZENADO de uma url, independente da idade (nunca expira
+   * para exibicao). Use para mostrar o ultimo preco conhecido sem rebuscar.
+   * @param {string} url
+   */
+  getStoredPrice(url) {
+    if (!url) return null;
+    const all = this._loadPrices();
+    return all[url] || null;
+  }
+
+  /**
+   * Retorna um mapa { url: precoArmazenado } para uma lista de urls, ignorando
+   * a idade. Usado para exibir precos instantaneamente a partir do disco.
+   * @param {string[]} urls
+   */
+  getStoredPrices(urls) {
+    const all = this._loadPrices();
+    const out = {};
+    for (const url of urls || []) {
+      if (url && all[url]) out[url] = all[url];
+    }
+    return out;
+  }
+
   /* ------------- CACHE DE LINKS DOS ALBUNS (24 horas) -------------------- */
 
   _loadLinksCache() {
