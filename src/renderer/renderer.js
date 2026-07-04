@@ -372,6 +372,13 @@ function renderGrid(albums, target) {
   }
   grid.innerHTML = albums.map(albumCardHtml).join('');
   trackImageProgress(grid);
+  // Arquiva no disco TODAS as capas desta página (não só as visíveis por causa
+  // do loading="lazy"), para tudo que foi visitado ficar salvo de uma vez e não
+  // precisar rebaixar na próxima visita.
+  const covers = [...new Set(albums.map((a) => a.cover).filter(Boolean))];
+  if (covers.length) {
+    Promise.resolve(api.prefetchImages(covers)).catch(() => {});
+  }
 }
 
 function renderPager() {
