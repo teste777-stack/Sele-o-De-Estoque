@@ -747,6 +747,56 @@ ipcMain.on('log:renderer', (_e, msg) => {
   console.log(typeof msg === 'string' ? msg : JSON.stringify(msg));
 });
 
+// Pré-cache em segundo plano: baixa TODAS as imagens que ainda faltam no disco,
+// respeitando a fila (5 por vez), sem depender do usuário rolar a página.
+let prefetchRunning = false;
+ipcMain.handle('cache:prefetchImages', async (_e, urls) => {
+  const list = Array.isArray(urls) ? urls.filter((u) => /^https?:\/\//i.test(u)) : [];
+  const missing = list.filter((u) => {
+    try {
+      return !fs.existsSync(imgCachePath(u));
+    } catch (_) {
+      return false;
+    }
+  });
+  if (prefetchRunning) {
+    console.log(`[cache] pré-cache já em andamento; ignorando novo pedido.`);
+    return { started: false, missing: missing.length };
+  }
+  if (!missing.length) {
+    console.log(`[cache] pré-cache: todas as ${list.length} imagens já estão no disco.`);
+    return { started: false, missing: 0 };
+  }
+  prefetchRunning = true;
+  console.log(
+    `[cache] pré-cache INICIADO: ${missing.length} imagem(ns) faltando de ${list.length} (5 por vez, em segundo plano)...`
+  );
+  (async () => {
+    let done = 0;
+    let idx = 0;
+    async function worker() {
+      while (idx < missing.length) {
+        const remote = missing[idx++];
+        try {
+          await ensureCached(remote, imgCachePath(remote));
+        } catch (_) {
+          /* falhas já são contabilizadas em imgStats */
+        }
+        done += 1;
+        if (done % 100 === 0 || done === missing.length) {
+          console.log(`[cache] pré-cache: ${done}/${missing.length} concluído`);
+        }
+      }
+    }
+    // Vários workers pegam da mesma lista; a fila interna limita a 5 downloads.
+    await Promise.all(Array.from({ length: MAX_DL }, () => worker()));
+    prefetchRunning = false;
+    const total = fs.existsSync(imageCacheDir) ? fs.readdirSync(imageCacheDir).length : 0;
+    console.log(`[cache] pré-cache FINALIZADO. Total arquivado no disco: ${total}`);
+  })();
+  return { started: true, missing: missing.length };
+});
+
 /* -------------------------------------------------------------------------- */
 /*  IPC: Motor de navegador (Puppeteer / Brave)                                */
 /* -------------------------------------------------------------------------- */

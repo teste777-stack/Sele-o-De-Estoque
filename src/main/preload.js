@@ -82,6 +82,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Log do renderer que também aparece no terminal do Electron (processo main).
   log: (msg) => ipcRenderer.send('log:renderer', msg),
 
+  // Pré-cache de imagens em segundo plano (baixa todas as que faltam no disco).
+  prefetchImages: (urls) => invoke('cache:prefetchImages', urls),
+
   // Motor de navegador (Puppeteer / Brave)
   configureEngine: (cfg) => invoke('engine:configure', cfg),
   engineStatus: () => invoke('engine:status'),

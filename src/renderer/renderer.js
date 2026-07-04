@@ -1029,6 +1029,15 @@ async function renderFavGrid() {
     `${storedCount} preços vindos do disco (cache) | ${imgs.length} imagens via cache local`;
   console.log(relatorio);
   api.log(relatorio); // também aparece no terminal do Electron
+
+  // Pré-cache em segundo plano de TODAS as capas dos favoritos (não só as que
+  // aparecem na tela), para tudo ficar arquivado sem precisar rolar a lista.
+  // Roda uma vez por sessão; reroda se a quantidade de favoritos mudar.
+  const allCovers = [...new Set(favs.map((f) => f.cover).filter(Boolean))];
+  if (allCovers.length && state._prefetchedCount !== favs.length) {
+    state._prefetchedCount = favs.length;
+    Promise.resolve(api.prefetchImages(allCovers)).catch(() => {});
+  }
   visible.forEach((f) => {
     const key = favKey(f.store, f.albumId);
     const link = (f.externalLinks || [])[0];
