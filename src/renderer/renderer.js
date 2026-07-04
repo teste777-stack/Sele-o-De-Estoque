@@ -56,6 +56,24 @@ function setCacheStatus(msg) {
   if (el) el.textContent = msg;
 }
 
+// Monta o relatório completo dos favoritos (contagens de itens, preços em cache,
+// preços a buscar e estado do cache de capas) na barra fixa.
+function renderFavReport() {
+  const r = state._favReport;
+  if (!r) return;
+  const parts = [`${r.favs} favoritos`];
+  if (r.withLink != null) parts.push(`${r.withLink} com link`);
+  if (r.pricesCache != null) parts.push(`${r.pricesCache} preços no cache`);
+  if (r.toFetch) parts.push(`buscando ${r.toFetch} preço(s)…`);
+  if (r.covers) {
+    parts.push(
+      `capas ${r.covers.cached}/${r.covers.total} no cache local` +
+        (r.covers.missing ? ` (arquivando ${r.covers.missing})` : ' ✓')
+    );
+  }
+  setCacheStatus(parts.join(' · '));
+}
+
 // Progresso visual de captura (fotos do cache + preços), ex.: "Capturando
 // fotos 12/340 · preços 3/50". Atualiza a barra de status conforme carrega.
 const progress = { photos: { done: 0, total: 0 }, prices: { done: 0, total: 0 } };
@@ -1020,6 +1038,16 @@ async function renderFavGrid() {
   console.log(relatorio);
   api.log(relatorio); // também aparece no terminal do Electron
 
+  // Relatório visível no app (barra fixa no topo dos Favoritos).
+  state._favReport = {
+    favs: visible.length,
+    withLink: allFavLinks.length,
+    pricesCache: storedCount,
+    toFetch: 0,
+    covers: null,
+  };
+  renderFavReport();
+
   // Pré-cache em segundo plano de TODAS as capas dos favoritos (não só as que
   // aparecem na tela), para tudo ficar arquivado sem precisar rolar a lista.
   // Chamado a cada render (é idempotente: o main só baixa o que falta e mostra
@@ -1028,12 +1056,10 @@ async function renderFavGrid() {
   if (allCovers.length) {
     Promise.resolve(api.prefetchImages(allCovers))
       .then((r) => {
-        if (!r) return;
-        const rep =
-          `Cache local de capas: ${r.cached}/${r.total}` +
-          (r.missing ? ` · arquivando ${r.missing} nova(s)…` : ' — completo ✓');
-        setCacheStatus(rep);
-        api.log(`[cache] ${rep}`);
+        if (!r || !state._favReport) return;
+        state._favReport.covers = { cached: r.cached, total: r.total, missing: r.missing };
+        renderFavReport();
+        api.log(`[cache] capas ${r.cached}/${r.total} no cache local (faltando ${r.missing})`);
       })
       .catch(() => {});
   }
@@ -1062,6 +1088,10 @@ async function renderFavGrid() {
   });
   const unique = [...new Set(favLinks)];
   if (!unique.length) return;
+  if (state._favReport) {
+    state._favReport.toFetch = unique.length;
+    renderFavReport();
+  }
   console.log(`[favoritos] buscando preços de ${unique.length} link(s) ainda sem cache…`);
   api.log(`[favoritos] buscando preços de ${unique.length} link(s) ainda sem cache…`);
   setStatus(`Buscando preços de ${unique.length} item(ns)…`);
@@ -1073,6 +1103,13 @@ async function renderFavGrid() {
     setStatus('Erro ao buscar preços: ' + e.message, true);
   } finally {
     endCancelable();
+    if (state._favReport) {
+      state._favReport.toFetch = 0;
+      state._favReport.pricesCache = (state._favReport.pricesCache || 0) + unique.length;
+      renderFavReport();
+    }
+  }
+}
   }
 }
 
