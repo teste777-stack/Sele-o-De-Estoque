@@ -1,13 +1,26 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, shell, session } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, session, protocol, net } = require('electron');
 const path = require('path');
+const { pathToFileURL } = require('url');
+const fs = require('fs');
+const crypto = require('crypto');
+const axios = require('axios');
 const scraper = require('./scraper');
 const Storage = require('./storage');
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// Esquema privilegiado usado para servir imagens do Yupoo a partir do cache
+// LOCAL (arquivadas em disco). Precisa ser registrado antes do app ficar pronto.
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'ycimg',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
+  },
+]);
 
 let storage = null;
 let mainWindow = null;
@@ -29,6 +42,114 @@ function refererFor(url) {
     /* ignora */
   }
   return currentReferer;
+}
+
+/* --------------------- Cache LOCAL de imagens do Yupoo -------------------- */
+// As imagens (capas/fotos) são baixadas uma vez e guardadas em disco, para não
+// dependerem do CDN do Yupoo (que bloqueia rajadas) e ficarem arquivadas.
+let imageCacheDir = null;
+const imgStats = { hits: 0, stored: 0, failed: 0 };
+function imgCachePath(remoteUrl) {
+  const h = crypto.createHash('sha1').update(remoteUrl).digest('hex');
+  let ext = '.jpg';
+  const m = String(remoteUrl).match(/\.(jpe?g|png|webp|gif)(?:\?|$)/i);
+  if (m) ext = '.' + m[1].toLowerCase().replace('jpeg', 'jpg');
+  return path.join(imageCacheDir, h + ext);
+}
+function mimeForFile(file) {
+  const e = path.extname(file).toLowerCase();
+  if (e === '.png') return 'image/png';
+  if (e === '.webp') return 'image/webp';
+  if (e === '.gif') return 'image/gif';
+  return 'image/jpeg';
+}
+
+/** Decodifica a URL remota embutida numa requisição ycimg://img/<base64url>. */
+function decodeYcimg(reqUrl) {
+  const u = new URL(reqUrl);
+  let b64 = u.pathname.replace(/^\/+/, '').replace(/-/g, '+').replace(/_/g, '/');
+  while (b64.length % 4) b64 += '=';
+  return Buffer.from(b64, 'base64').toString('utf8');
+}
+
+// Fila de downloads com concorrência limitada: o Yupoo segura/limita muitas
+// conexões simultâneas (imagens ficavam pendentes "pela metade"). Baixamos
+// poucas por vez e reaproveitamos downloads em andamento (dedupe).
+const MAX_DL = 5;
+let activeDl = 0;
+const dlQueue = [];
+const inflight = new Map(); // remote -> Promise<void>
+function acquireSlot() {
+  if (activeDl < MAX_DL) {
+    activeDl += 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => dlQueue.push(resolve));
+}
+function releaseSlot() {
+  const next = dlQueue.shift();
+  if (next) next();
+  else activeDl = Math.max(0, activeDl - 1);
+}
+
+/** Garante que a imagem esteja em disco (baixa uma vez, com limite/ dedupe). */
+function ensureCached(remote, file) {
+  if (fs.existsSync(file)) return Promise.resolve();
+  if (inflight.has(remote)) return inflight.get(remote);
+  const p = (async () => {
+    await acquireSlot();
+    try {
+      if (fs.existsSync(file)) return;
+      const res = await axios.get(remote, {
+        responseType: 'arraybuffer',
+        timeout: 15000,
+        headers: { Referer: refererFor(remote), 'User-Agent': USER_AGENT },
+      });
+      fs.writeFileSync(file, Buffer.from(res.data));
+      imgStats.stored += 1;
+      const total = fs.readdirSync(imageCacheDir).length;
+      console.log(
+        `[cache] ARMAZENOU imagem #${imgStats.stored} (${res.data.byteLength} bytes) | total no disco: ${total}`
+      );
+    } finally {
+      releaseSlot();
+      inflight.delete(remote);
+    }
+  })();
+  inflight.set(remote, p);
+  return p;
+}
+
+/** Handler do esquema ycimg: serve do disco ou baixa (com Referer) e arquiva. */
+async function handleYcimg(request) {
+  try {
+    const remote = decodeYcimg(request.url);
+    if (!/^https?:\/\//i.test(remote)) return new Response('', { status: 400 });
+    const file = imgCachePath(remote);
+    const hadFile = fs.existsSync(file);
+    try {
+      await ensureCached(remote, file);
+    } catch (e) {
+      imgStats.failed += 1;
+      if (imgStats.failed % 10 === 0) {
+        console.log(`[cache] FALHAS ao baixar: ${imgStats.failed} | último erro: ${e.message}`);
+      }
+    }
+    if (fs.existsSync(file)) {
+      if (hadFile) {
+        imgStats.hits += 1;
+        if (imgStats.hits % 50 === 0) {
+          console.log(`[cache] HITS do disco: ${imgStats.hits} (servidas sem baixar)`);
+        }
+      }
+      // Serve o arquivo local (método robusto do Electron para renderizar imagem).
+      return net.fetch(pathToFileURL(file).toString());
+    }
+    return new Response('', { status: 404 });
+  } catch (e) {
+    console.log(`[cache] FALHA: ${e.message}`);
+    return new Response('', { status: 404 });
+  }
 }
 
 function createWindow() {
@@ -63,6 +184,21 @@ function createWindow() {
 
 app.whenReady().then(() => {
   storage = new Storage(app.getPath('userData'));
+
+  // Pasta do cache local de imagens (arquivo permanente das fotos).
+  imageCacheDir = path.join(app.getPath('userData'), 'image-cache');
+  try {
+    fs.mkdirSync(imageCacheDir, { recursive: true });
+  } catch (_) {
+    /* ignora */
+  }
+  protocol.handle('ycimg', handleYcimg);
+  try {
+    const n = fs.readdirSync(imageCacheDir).length;
+    console.log(`[cache] pronto. Imagens já arquivadas no disco: ${n} | pasta: ${imageCacheDir}`);
+  } catch (_) {
+    /* ignora */
+  }
 
   // Injeta Referer/User-Agent nas imagens do Yupoo para driblar o anti-hotlink.
   const filter = { urls: ['*://*.yupoo.com/*'] };
@@ -203,6 +339,20 @@ async function fetchPricesCached(urls, onItem) {
     const cached = storage.getCachedPrice(url);
     if (cached) {
       const item = { ...cached, cached: true };
+      // Preço válido em cache: mantém o preço base e só atualiza USD/BRL com a
+      // cotação atual (sem nova raspagem).
+      if (cached.ok && cached.price != null) {
+        try {
+          const conv = await scraper.refreshConversions(cached);
+          if (conv) {
+            item.usd = conv.usd;
+            item.brl = conv.brl;
+            storage.updateConversions(url, conv).catch(() => {});
+          }
+        } catch (_) {
+          /* mantém conversão antiga se a cotação falhar */
+        }
+      }
       results.push(item);
       if (onItem) onItem(item);
     } else {
@@ -591,6 +741,11 @@ ipcMain.handle(
     return true;
   })
 );
+
+// Log vindo do renderer: ecoa no terminal do Electron (processo main).
+ipcMain.on('log:renderer', (_e, msg) => {
+  console.log(typeof msg === 'string' ? msg : JSON.stringify(msg));
+});
 
 /* -------------------------------------------------------------------------- */
 /*  IPC: Motor de navegador (Puppeteer / Brave)                                */

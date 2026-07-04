@@ -79,6 +79,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Utilidades
   openExternal: (url) => invoke('shell:openExternal', url),
 
+  // Log do renderer que também aparece no terminal do Electron (processo main).
+  log: (msg) => ipcRenderer.send('log:renderer', msg),
+
   // Motor de navegador (Puppeteer / Brave)
   configureEngine: (cfg) => invoke('engine:configure', cfg),
   engineStatus: () => invoke('engine:status'),

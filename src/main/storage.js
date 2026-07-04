@@ -42,6 +42,15 @@ class Storage {
     this._prices = null;
     this.pricesFile = path.join(userDataDir, 'prices.json');
     /**
+     * Histórico de preços por url: registra cada mudança do preço BASE
+     * (price/currency) ao longo do tempo. Não cresce a cada atualização de
+     * câmbio — só quando o valor raspado muda.
+     * Chave: url -> [{ ts, price, currency, usd, brl }]
+     * @type {Object<string,Array>|null}
+     */
+    this._priceHistory = null;
+    this.priceHistoryFile = path.join(userDataDir, 'price-history.json');
+    /**
      * Cache do mapeamento album->links de compra, valido por 24h.
      * Chave: `${store}::${id}`.
      * @type {Object<string,{hasLink:boolean,externalLinks:string[],ts:number}>|null}
@@ -444,7 +453,10 @@ class Storage {
   }
 
   /**
-   * Retorna o preco em cache se ainda for do mesmo dia (< 24h). Senao null.
+   * Retorna o preco em cache se ainda for utilizavel. Um preco VALIDO (ok, com
+   * valor) nunca expira: e mantido para sempre e nunca re-raspado — apenas as
+   * conversoes USD/BRL sao atualizadas na exibicao. Falhas expiram em 24h para
+   * poderem ser tentadas de novo.
    * @param {string} url
    */
   getCachedPrice(url) {
@@ -452,8 +464,9 @@ class Storage {
     const all = this._loadPrices();
     const e = all[url];
     if (!e || !e.ts) return null;
+    if (e.ok && e.price != null) return e; // preco valido -> mantido permanentemente
     const DAY = 24 * 60 * 60 * 1000;
-    if (Date.now() - e.ts >= DAY) return null; // expirou -> atualizar hoje
+    if (Date.now() - e.ts >= DAY) return null; // falha antiga -> tentar de novo
     return e;
   }
 
@@ -461,7 +474,35 @@ class Storage {
   async setCachedPrice(url, data) {
     if (!url || !data) return;
     const all = this._loadPrices();
+    const prev = all[url];
     all[url] = { ...data, url, ts: Date.now() };
+    this._prices = all;
+    // Histórico: registra quando o preço BASE muda (novo, ou valor/moeda diferente).
+    if (data.ok && data.price != null) {
+      const changed =
+        !prev ||
+        !prev.ok ||
+        prev.price !== data.price ||
+        (prev.currency || 'CNY') !== (data.currency || 'CNY');
+      if (changed) this._appendPriceHistory(url, data);
+    }
+    await this._savePrices();
+  }
+
+  /**
+   * Atualiza APENAS as conversões USD/BRL de um preço já armazenado, sem mexer
+   * no preço base nem no timestamp (não conta como nova raspagem).
+   * @param {string} url
+   * @param {{usd:number,brl:number}} conv
+   */
+  async updateConversions(url, conv) {
+    if (!url || !conv) return;
+    const all = this._loadPrices();
+    const e = all[url];
+    if (!e) return;
+    if (e.usd === conv.usd && e.brl === conv.brl) return; // nada mudou
+    e.usd = conv.usd;
+    e.brl = conv.brl;
     this._prices = all;
     await this._savePrices();
   }
@@ -489,6 +530,48 @@ class Storage {
       if (url && all[url]) out[url] = all[url];
     }
     return out;
+  }
+
+  /* ------------------- HISTÓRICO DE PREÇOS (saldo) ---------------------- */
+
+  _loadPriceHistory() {
+    if (this._priceHistory) return this._priceHistory;
+    try {
+      const txt = fs.readFileSync(this.priceHistoryFile, 'utf8');
+      this._priceHistory = JSON.parse(txt);
+      if (!this._priceHistory || typeof this._priceHistory !== 'object') this._priceHistory = {};
+    } catch (_) {
+      this._priceHistory = {};
+    }
+    return this._priceHistory;
+  }
+
+  async _savePriceHistory() {
+    return this._saveDebounced('priceHistory', this.priceHistoryFile, () => this._priceHistory);
+  }
+
+  /** Acrescenta uma entrada ao histórico de preços de uma url. */
+  _appendPriceHistory(url, data) {
+    const hist = this._loadPriceHistory();
+    const arr = hist[url] || (hist[url] = []);
+    arr.push({
+      ts: Date.now(),
+      price: data.price,
+      currency: data.currency || 'CNY',
+      usd: data.usd != null ? data.usd : null,
+      brl: data.brl != null ? data.brl : null,
+    });
+    // Mantém o histórico enxuto (últimas 50 mudanças por link).
+    if (arr.length > 50) hist[url] = arr.slice(-50);
+    this._priceHistory = hist;
+    this._savePriceHistory().catch(() => {});
+  }
+
+  /** Retorna o histórico de preços de uma url (array cronológico) ou []. */
+  getPriceHistory(url) {
+    if (!url) return [];
+    const hist = this._loadPriceHistory();
+    return hist[url] || [];
   }
 
   /* ------------- CACHE DE LINKS DOS ALBUNS (24 horas) -------------------- */

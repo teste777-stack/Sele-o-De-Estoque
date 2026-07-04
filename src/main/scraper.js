@@ -666,6 +666,23 @@ function convertCurrency(amount, from, to, rates) {
   return (amount / rFrom) * rTo; // amount(from) -> USD -> to
 }
 
+/**
+ * Recalcula APENAS as conversões USD/BRL de um preço já conhecido, usando as
+ * cotações atuais. Não faz nova raspagem: preserva o preço base (price/currency)
+ * e só atualiza dólar/real. Retorna { usd, brl } ou null se não der para converter.
+ * @param {{price:number,currency:string}} entry
+ */
+async function refreshConversions(entry) {
+  if (!entry || entry.price == null) return null;
+  const currency = entry.currency || 'CNY';
+  const rates = await getRates();
+  if (!rates) return null;
+  return {
+    usd: round2(convertCurrency(entry.price, currency, 'USD', rates)),
+    brl: round2(convertCurrency(entry.price, currency, 'BRL', rates)),
+  };
+}
+
 /** Arredonda para 2 casas decimais (retorna number ou null). */
 function round2(n) {
   if (n == null || !Number.isFinite(n)) return null;
@@ -816,6 +833,7 @@ module.exports = {
   fetchPrices,
   parsePriceFromText,
   priceFromText,
+  refreshConversions,
   setFetchMode,
   browser,
 };

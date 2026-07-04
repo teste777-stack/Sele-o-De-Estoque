@@ -35,8 +35,11 @@ const state = {
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-function showLoading(on) {
-  $('#loading').classList.toggle('hidden', !on);
+function showLoading(on, label) {
+  const el = $('#loading');
+  const txt = $('#loadingText');
+  if (txt) txt.textContent = label ? `${label}…` : 'Carregando…';
+  el.classList.toggle('hidden', !on);
 }
 
 function setStatus(msg, isError) {
@@ -44,6 +47,49 @@ function setStatus(msg, isError) {
   el.textContent = msg || '';
   el.style.color = isError ? 'var(--danger)' : 'var(--accent-2)';
   if (msg) setTimeout(() => (el.textContent === msg ? (el.textContent = '') : null), 4000);
+}
+
+// Progresso visual de captura (fotos do cache + preços), ex.: "Capturando
+// fotos 12/340 · preços 3/50". Atualiza a barra de status conforme carrega.
+const progress = { photos: { done: 0, total: 0 }, prices: { done: 0, total: 0 } };
+function renderProgress() {
+  const parts = [];
+  if (progress.photos.total)
+    parts.push(`fotos ${progress.photos.done}/${progress.photos.total}`);
+  if (progress.prices.total)
+    parts.push(`preços ${progress.prices.done}/${progress.prices.total}`);
+  if (parts.length) setStatus('Capturando ' + parts.join(' · '));
+}
+
+/**
+ * Acompanha o carregamento das imagens do cache local (ycimg://) num container
+ * e mostra "Capturando fotos X/Y" na barra de status conforme cada uma chega.
+ */
+function trackImageProgress(container) {
+  if (!container) return;
+  const imgs = [...container.querySelectorAll('img[src^="ycimg://"]')];
+  progress.photos.total = imgs.length;
+  progress.photos.done = 0;
+  progress.prices.total = 0; // novo grid: zera o progresso de preços antigo
+  progress.prices.done = 0;
+  if (!imgs.length) {
+    renderProgress();
+    return;
+  }
+  const bump = () => {
+    progress.photos.done = Math.min(progress.photos.total, progress.photos.done + 1);
+    renderProgress();
+  };
+  imgs.forEach((img) => {
+    if (img.complete) {
+      // Já terminou (carregada ou com erro): conta como concluída.
+      progress.photos.done += 1;
+    } else {
+      img.addEventListener('load', bump, { once: true });
+      img.addEventListener('error', bump, { once: true });
+    }
+  });
+  renderProgress();
 }
 
 // Controla a exibicao do botao "Parar" durante buscas de links/precos.
@@ -71,6 +117,21 @@ function esc(s) {
 
 function favKey(store, id) {
   return `${store}::${id}`;
+}
+
+/**
+ * Converte uma URL de imagem do Yupoo no esquema local `ycimg://` para que a
+ * imagem seja baixada uma vez e servida do DISCO (arquivada, sem depender do
+ * CDN do Yupoo que bloqueia rajadas). URLs não-Yupoo passam sem alteração.
+ */
+function cimg(url) {
+  if (!url) return '';
+  if (!/^https?:\/\/(photo\.yupoo\.com|[a-z0-9-]+\.x\.yupoo\.com)/i.test(url)) return url;
+  const b64 = btoa(unescape(encodeURIComponent(url)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  return 'ycimg://img/' + b64;
 }
 
 /** Formata um preco com a moeda original + conversao para US$ e R$. */
@@ -127,7 +188,7 @@ function reRenderPrices() {
 
 /** Envolve chamadas da API tratando o formato { ok, data, error }. */
 async function call(promise, label) {
-  showLoading(true);
+  showLoading(true, label);
   try {
     const res = await promise;
     if (!res || !res.ok) throw new Error((res && res.error) || 'Erro desconhecido');
@@ -265,7 +326,7 @@ function albumCardHtml(a) {
   const isFav = state.favKeys.has(favKey(state.store, a.id));
   const cat = a.category ? `<div class="cat-tag">${esc(a.category.name)}</div>` : '';
   const cover = a.cover
-    ? `<img loading="lazy" src="${esc(a.cover)}" alt="" />`
+    ? `<img loading="lazy" src="${esc(cimg(a.cover))}" alt="" />`
     : '';
   const seen = state.seenAll || (state.seen && state.seen.has(String(a.id)));
   const seenBadge = seen
@@ -302,6 +363,7 @@ function renderGrid(albums, target) {
     return;
   }
   grid.innerHTML = albums.map(albumCardHtml).join('');
+  trackImageProgress(grid);
 }
 
 function renderPager() {
@@ -510,10 +572,53 @@ async function loadCategories() {
 /* --------------------------- Modal do album ------------------------------- */
 async function openAlbum(id) {
   const meta = state.currentAlbums.find((a) => String(a.id) === String(id)) || {};
-  const detail = await call(api.getAlbum(state.store, id), 'Abrir álbum');
+  let detail;
+  try {
+    detail = await call(api.getAlbum(state.store, id), 'Abrindo álbum');
+  } catch (err) {
+    // Rede falhou: se for um favorito, usa as fotos JA SALVAS.
+    const f = (state.favList || []).find(
+      (x) => x.store === state.store && String(x.albumId) === String(id)
+    );
+    if (f && Array.isArray(f.photos) && f.photos.length) {
+      return openFavorite(state.store, id);
+    }
+    throw err;
+  }
   // preserva a categoria de navegacao (origem do arquivamento)
   detail.category = meta.category || state.currentCategory || null;
   detail.cover = meta.cover || (detail.photos[0] && detail.photos[0].thumb) || null;
+  state.currentAlbumDetail = detail;
+  renderModal(detail);
+  $('#modal').classList.remove('hidden');
+}
+
+/**
+ * Abre um favorito usando os dados JA SALVOS (fotos, links) sem rebuscar da
+ * rede. Assim as fotos aparecem mesmo se a loja estiver bloqueada/fora do ar.
+ * Só busca da rede se o favorito não tiver fotos armazenadas.
+ */
+async function openFavorite(store, albumId) {
+  state.store = store;
+  const f = (state.favList || []).find(
+    (x) => x.store === store && String(x.albumId) === String(albumId)
+  );
+  if (!f || !Array.isArray(f.photos) || !f.photos.length) {
+    // Sem fotos salvas: tenta buscar da rede como fallback.
+    return openAlbum(albumId);
+  }
+  const detail = {
+    id: f.albumId,
+    store: f.store,
+    title: f.title || 'Sem título',
+    url: f.url,
+    cover: f.cover || (f.photos[0] && f.photos[0].thumb) || null,
+    photoCount: f.photoCount != null ? f.photoCount : f.photos.length,
+    photos: f.photos,
+    externalLinks: f.externalLinks || [],
+    rawLinks: f.rawLinks || [],
+    category: f.category || null,
+  };
   state.currentAlbumDetail = detail;
   renderModal(detail);
   $('#modal').classList.remove('hidden');
@@ -556,7 +661,7 @@ function renderModal(a) {
       ${a.photos
         .map(
           (p) =>
-            `<img loading="lazy" src="${esc(p.thumb)}" data-ext="${esc(
+            `<img loading="lazy" src="${esc(cimg(p.thumb))}" data-ext="${esc(
               p.origin
             )}" title="Abrir original" />`
         )
@@ -794,7 +899,7 @@ function favCardHtml(f) {
   const host = f.store.replace(/^https?:\/\//, '');
   const cat = f.category ? `<div class="cat-tag">${esc(f.category.name)}</div>` : '';
   const nLinks = (f.externalLinks || []).length;
-  const cover = f.cover ? `<img loading="lazy" src="${esc(f.cover)}" alt="" />` : '';
+  const cover = f.cover ? `<img loading="lazy" src="${esc(cimg(f.cover))}" alt="" />` : '';
   const favTags = Array.isArray(f.tags) ? f.tags : [];
   const chips = favTags
     .map(
@@ -877,26 +982,34 @@ async function renderFavGrid() {
     return;
   }
   grid.innerHTML = visible.map(favCardHtml).join('');
+  trackImageProgress(grid);
   // Guarda os favoritos visiveis para "Selecionar visiveis" e atualiza o contador.
   state._visibleFavKeys = visible.map((f) => favKey(f.store, f.albumId));
   updateSelCount();
   // Preços pelo NOME do álbum (fallback quando não há link de loja).
-  try {
-    const tp = await call(
-      api.pricesFromTitles(
-        visible.map((f) => ({ id: favKey(f.store, f.albumId), title: f.title, url: f.url }))
-      ),
-      'Preços pelo nome'
-    );
-    state.titlePrices = tp || {};
-  } catch (_) {
-    state.titlePrices = {};
+  // Só calcula os que ainda NÃO estão no cache em memória — evita refazer o
+  // trabalho dos 2k+ favoritos toda vez que a aba é aberta. Roda sem travar a tela.
+  if (!state.titlePrices) state.titlePrices = {};
+  const needTitles = visible.filter((f) => !(favKey(f.store, f.albumId) in state.titlePrices));
+  if (needTitles.length) {
+    try {
+      const tp = await callQuiet(
+        api.pricesFromTitles(
+          needTitles.map((f) => ({ id: favKey(f.store, f.albumId), title: f.title, url: f.url }))
+        ),
+        'Preços pelo nome'
+      );
+      Object.assign(state.titlePrices, tp || {});
+    } catch (_) {
+      /* segue sem preços por nome */
+    }
   }
 
   // Preços automáticos nos favoritos (usa o primeiro link de cada favorito).
   const favLinks = [];
   // Carrega do disco os precos ja obtidos, para exibir na hora sem rebuscar.
   const allFavLinks = visible.map((f) => (f.externalLinks || [])[0]).filter(Boolean);
+  let storedCount = 0;
   if (allFavLinks.length) {
     try {
       const stored = await callQuiet(
@@ -904,10 +1017,18 @@ async function renderFavGrid() {
         'Cache preços'
       );
       Object.assign(state.prices, stored || {});
+      storedCount = Object.keys(stored || {}).length;
     } catch (_) {
       /* segue sem cache */
     }
   }
+  // Conta quantas imagens usam o cache local (ycimg://).
+  const imgs = $('#favGrid').querySelectorAll('img[src^="ycimg://"]');
+  const relatorio =
+    `[favoritos] ${visible.length} favoritos | ${allFavLinks.length} com link | ` +
+    `${storedCount} preços vindos do disco (cache) | ${imgs.length} imagens via cache local`;
+  console.log(relatorio);
+  api.log(relatorio); // também aparece no terminal do Electron
   visible.forEach((f) => {
     const key = favKey(f.store, f.albumId);
     const link = (f.externalLinks || [])[0];
@@ -933,6 +1054,8 @@ async function renderFavGrid() {
   });
   const unique = [...new Set(favLinks)];
   if (!unique.length) return;
+  console.log(`[favoritos] buscando preços de ${unique.length} link(s) ainda sem cache…`);
+  api.log(`[favoritos] buscando preços de ${unique.length} link(s) ainda sem cache…`);
   setStatus(`Buscando preços de ${unique.length} item(ns)…`);
   beginCancelable();
   try {
@@ -1378,7 +1501,9 @@ function bindEvents() {
       updatePriceBadge(item.url);
       updateAlbumPrice(item.url);
     }
-    setStatus(`Buscando preços… ${done}/${total}`);
+    progress.prices.done = done;
+    progress.prices.total = total;
+    renderProgress();
   });
 
   // Progresso da verificacao em massa de lojas.
@@ -1433,10 +1558,9 @@ function bindEvents() {
       setStatus('Copiado.');
     } else if (t.dataset.favOpen) {
       e.preventDefault();
-      state.store = t.dataset.favOpenStore;
-      $('#storeUrl').value = state.store;
+      $('#storeUrl').value = t.dataset.favOpenStore;
       switchView('albums');
-      openAlbum(t.dataset.favOpen);
+      openFavorite(t.dataset.favOpenStore, t.dataset.favOpen);
     } else if (t.dataset.favRemove) {
       e.preventDefault();
       const store = t.dataset.favRemoveStore;
