@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src https: data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    />
+    <title>Yupoo Scraper</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- Barra superior: loja + navegacao -->
+    <header class="topbar">
+      <div class="brand">Yupoo<span>Scraper</span></div>
+
+      <div class="store-input">
+        <input
+          id="storeUrl"
+          type="text"
+          placeholder="https://akdingji.x.yupoo.com"
+          value="https://akdingji.x.yupoo.com"
+        />
+        <button id="loadStore" class="btn primary">Carregar</button>
+      </div>
+
+      <nav class="tabs">
+        <button class="tab active" data-view="albums">Mega Grade</button>
+        <button class="tab" data-view="categories">Categorias</button>
+        <button class="tab" data-view="favorites">Favoritos</button>
+        <button class="tab" data-view="session">Links Das Sessão</button>
+        <button class="tab" data-view="verify">Verificar Links</button>
+      </nav>
+    </header>
+
+    <!-- Barra de acoes contextual -->
+    <div class="actionbar">
+      <div id="crumbs" class="crumbs">Nenhuma loja carregada</div>
+      <label class="switch">
+        <input type="checkbox" id="checkLinksToggle" checked />
+        <span>Buscar links e preços (página atual)</span>
+      </label>
+      <label class="profit" title="Simula o preço de venda somando a margem de lucro">
+        <span>Lucro %</span>
+        <input type="number" id="profitPct" min="0" step="1" placeholder="0" />
+      </label>
+      <div class="engine">
+        <label for="engineMode">Motor:</label>
+        <select id="engineMode" title="Como buscar as páginas do Yupoo">
+          <option value="http">HTTP (rápido)</option>
+          <option value="auto" selected>Auto (HTTP + navegador)</option>
+          <option value="chromium">Chromium (Puppeteer)</option>
+          <option value="brave-launch">Abrir Brave</option>
+          <option value="brave-connect">Conectar ao Brave aberto</option>
+        </select>
+        <input
+          id="braveURL"
+          class="brave-url hidden"
+          type="text"
+          value="http://127.0.0.1:9222"
+          title="URL de debug do Brave (--remote-debugging-port=9222)"
+        />
+        <span id="engineStatus" class="engine-status"></span>
+      </div>
+      <div class="spacer"></div>
+      <button id="cancelLoading" class="btn danger hidden">■ Parar</button>
+      <div id="statusMsg" class="status"></div>
+    </div>
+
+    <main id="app">
+      <!-- ALBUNS / CATEGORIA -->
+      <section id="view-albums" class="view active">
+        <div id="albumGrid" class="grid"></div>
+        <div id="albumPager" class="pager"></div>
+      </section>
+
+      <!-- CATEGORIAS -->
+      <section id="view-categories" class="view">
+        <div id="categoryList" class="category-list"></div>
+      </section>
+
+      <!-- FAVORITOS -->
+      <section id="view-favorites" class="view">
+        <div class="panel-head">
+          <h2>Favoritos (armazenamento principal)</h2>
+          <button id="exportFav" class="btn">Exportar JSON</button>
+        </div>
+        <div class="tag-bar">
+          <div class="tag-create">
+            <input id="newTagName" type="text" placeholder="Nova tag (ex: Camisa, Nike...)" />
+            <select id="newTagKind" title="Tipo da tag">
+              <option value="categoria">Categoria</option>
+              <option value="marca">Marca</option>
+            </select>
+            <button id="addTagBtn" class="btn small primary">Criar tag</button>
+          </div>
+          <div id="tagFilters" class="tag-filters"></div>
+          <div class="tag-assign">
+            <span class="tag-assign-hint">Marque os produtos, selecione tags acima e clique:</span>
+            <button id="selectAllFavs" class="btn small">Selecionar visíveis</button>
+            <button id="clearSelFavs" class="btn small">Limpar seleção</button>
+            <span id="selCount" class="sel-count">0 selecionados</span>
+            <button id="assignTagsBtn" class="btn small primary">Atribuir tags selecionadas</button>
+          </div>
+        </div>
+        <div id="favGrid" class="grid"></div>
+      </section>
+
+      <!-- LINKS DE COMPRA POR SITE (permanente) -->
+      <section id="view-session" class="view">
+        <div class="panel-head">
+          <h2>Sites com links de compra (salvos)</h2>
+          <button id="fetchPrices" class="btn">Buscar preços</button>
+          <button id="exportSession" class="btn">Exportar .txt</button>
+        </div>
+        <ul id="sessionList" class="link-list"></ul>
+      </section>
+
+      <!-- VERIFICAR LINKS DE LOJA EM VARIAS LOJAS -->
+      <section id="view-verify" class="view">
+        <div class="panel-head">
+          <h2>Verificar links de loja em várias lojas</h2>
+          <button id="verifyRun" class="btn primary">Verificar</button>
+          <button id="verifyClear" class="btn">Limpar</button>
+        </div>
+        <textarea
+          id="verifyInput"
+          class="verify-input"
+          placeholder="Cole uma loja Yupoo por linha, ex.:&#10;https://ogwave.x.yupoo.com&#10;https://akdingji.x.yupoo.com"
+        ></textarea>
+        <div id="verifyResults" class="verify-results"></div>
+        <div class="panel-head">
+          <h2>Lojas salvas com links de loja</h2>
+        </div>
+        <ul id="pricedList" class="link-list"></ul>
+      </section>
+    </main>
+
+    <!-- MODAL detalhe do album -->
+    <div id="modal" class="modal hidden">
+      <div class="modal-backdrop" data-close></div>
+      <div class="modal-body">
+        <button class="modal-close" data-close>&times;</button>
+        <div id="modalContent"></div>
+      </div>
+    </div>
+
+    <div id="loading" class="loading hidden"><div class="spinner"></div></div>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>
