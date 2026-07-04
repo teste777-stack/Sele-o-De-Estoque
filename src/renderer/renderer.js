@@ -1110,8 +1110,6 @@ async function renderFavGrid() {
     }
   }
 }
-  }
-}
 
 /* ------------------ Links de compra por site (permanente) ----------------- */
 async function renderSession() {
