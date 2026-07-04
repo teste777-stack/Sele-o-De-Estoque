@@ -1,8 +1,7 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, shell, session, protocol, net } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, session, protocol } = require('electron');
 const path = require('path');
-const { pathToFileURL } = require('url');
 const fs = require('fs');
 const crypto = require('crypto');
 const axios = require('axios');
@@ -127,23 +126,35 @@ async function handleYcimg(request) {
     if (!/^https?:\/\//i.test(remote)) return new Response('', { status: 400 });
     const file = imgCachePath(remote);
     const hadFile = fs.existsSync(file);
-    try {
-      await ensureCached(remote, file);
-    } catch (e) {
-      imgStats.failed += 1;
-      if (imgStats.failed % 10 === 0) {
-        console.log(`[cache] FALHAS ao baixar: ${imgStats.failed} | último erro: ${e.message}`);
+    // Se já está no disco, serve na hora. Só baixa (e aguarda) quando falta.
+    if (!hadFile) {
+      try {
+        await ensureCached(remote, file);
+      } catch (e) {
+        imgStats.failed += 1;
+        if (imgStats.failed % 10 === 0) {
+          console.log(`[cache] FALHAS ao baixar: ${imgStats.failed} | último erro: ${e.message}`);
+        }
       }
     }
     if (fs.existsSync(file)) {
       if (hadFile) {
         imgStats.hits += 1;
-        if (imgStats.hits % 50 === 0) {
+        if (imgStats.hits % 200 === 0) {
           console.log(`[cache] HITS do disco: ${imgStats.hits} (servidas sem baixar)`);
         }
       }
-      // Serve o arquivo local (método robusto do Electron para renderizar imagem).
-      return net.fetch(pathToFileURL(file).toString());
+      // Lê os bytes direto do disco e devolve na resposta. Não passa pelo
+      // net.fetch/cache de rede do Electron (que era lento e podia falhar com
+      // "Unable to create cache" quando havia lock). Imagens são pequenas.
+      const data = await fs.promises.readFile(file);
+      return new Response(data, {
+        status: 200,
+        headers: {
+          'content-type': mimeForFile(file),
+          'cache-control': 'no-store',
+        },
+      });
     }
     return new Response('', { status: 404 });
   } catch (e) {
