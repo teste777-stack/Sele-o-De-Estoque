@@ -62,33 +62,16 @@ function renderProgress() {
 }
 
 /**
- * Acompanha o carregamento das imagens do cache local (ycimg://) num container
- * e mostra "Capturando fotos X/Y" na barra de status conforme cada uma chega.
+ * Chamado ao renderizar uma grade nova: zera o progresso de preços da grade
+ * anterior. O progresso de FOTOS não é mais medido pelo evento `load` das
+ * imagens (com `loading="lazy"` as imagens fora da tela nunca disparam `load`,
+ * o que deixava o contador travado). Ele agora reflete o pré-cache real
+ * (arquivamento em segundo plano), enviado pelo processo principal.
  */
 function trackImageProgress(container) {
   if (!container) return;
-  const imgs = [...container.querySelectorAll('img[src^="ycimg://"]')];
-  progress.photos.total = imgs.length;
-  progress.photos.done = 0;
   progress.prices.total = 0; // novo grid: zera o progresso de preços antigo
   progress.prices.done = 0;
-  if (!imgs.length) {
-    renderProgress();
-    return;
-  }
-  const bump = () => {
-    progress.photos.done = Math.min(progress.photos.total, progress.photos.done + 1);
-    renderProgress();
-  };
-  imgs.forEach((img) => {
-    if (img.complete) {
-      // Já terminou (carregada ou com erro): conta como concluída.
-      progress.photos.done += 1;
-    } else {
-      img.addEventListener('load', bump, { once: true });
-      img.addEventListener('error', bump, { once: true });
-    }
-  });
   renderProgress();
 }
 
@@ -1515,7 +1498,19 @@ function bindEvents() {
     renderProgress();
   });
 
-  // Progresso da verificacao em massa de lojas.
+  // Progresso do pré-cache de fotos (arquivamento em segundo plano). Só aparece
+  // quando há imagens novas para baixar; some ao terminar.
+  api.onCacheProgress(({ done, total, finished }) => {
+    if (finished) {
+      progress.photos.done = 0;
+      progress.photos.total = 0;
+      setStatus(`Fotos arquivadas: ${done} nova(s). Tudo no cache local.`);
+    } else {
+      progress.photos.done = done;
+      progress.photos.total = total;
+    }
+    renderProgress();
+  });
   api.onBulkProgress(({ done, total, entry }) => {
     if (entry && entry.store) {
       const idx = state.verify.results.findIndex(

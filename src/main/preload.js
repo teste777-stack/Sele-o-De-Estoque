@@ -84,6 +84,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Pré-cache de imagens em segundo plano (baixa todas as que faltam no disco).
   prefetchImages: (urls) => invoke('cache:prefetchImages', urls),
+  onCacheProgress: (cb) => {
+    const listener = (_e, payload) => cb(payload);
+    ipcRenderer.on('cache:progress', listener);
+    return () => ipcRenderer.removeListener('cache:progress', listener);
+  },
 
   // Motor de navegador (Puppeteer / Brave)
   configureEngine: (cfg) => invoke('engine:configure', cfg),

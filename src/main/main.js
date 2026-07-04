@@ -771,6 +771,17 @@ ipcMain.handle('cache:prefetchImages', async (_e, urls) => {
   console.log(
     `[cache] pré-cache INICIADO: ${missing.length} imagem(ns) faltando de ${list.length} (5 por vez, em segundo plano)...`
   );
+  const total = missing.length;
+  const sendProgress = (done, finished) => {
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('cache:progress', { done, total, finished: !!finished });
+      }
+    } catch (_) {
+      /* janela pode ter fechado */
+    }
+  };
+  sendProgress(0, false);
   (async () => {
     let done = 0;
     let idx = 0;
@@ -783,6 +794,7 @@ ipcMain.handle('cache:prefetchImages', async (_e, urls) => {
           /* falhas já são contabilizadas em imgStats */
         }
         done += 1;
+        sendProgress(done, false);
         if (done % 100 === 0 || done === missing.length) {
           console.log(`[cache] pré-cache: ${done}/${missing.length} concluído`);
         }
@@ -791,8 +803,9 @@ ipcMain.handle('cache:prefetchImages', async (_e, urls) => {
     // Vários workers pegam da mesma lista; a fila interna limita a 5 downloads.
     await Promise.all(Array.from({ length: MAX_DL }, () => worker()));
     prefetchRunning = false;
-    const total = fs.existsSync(imageCacheDir) ? fs.readdirSync(imageCacheDir).length : 0;
-    console.log(`[cache] pré-cache FINALIZADO. Total arquivado no disco: ${total}`);
+    sendProgress(done, true);
+    const totalDisco = fs.existsSync(imageCacheDir) ? fs.readdirSync(imageCacheDir).length : 0;
+    console.log(`[cache] pré-cache FINALIZADO. Total arquivado no disco: ${totalDisco}`);
   })();
   return { started: true, missing: missing.length };
 });
