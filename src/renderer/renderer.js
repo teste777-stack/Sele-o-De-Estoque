@@ -49,6 +49,13 @@ function setStatus(msg, isError) {
   if (msg) setTimeout(() => (el.textContent === msg ? (el.textContent = '') : null), 4000);
 }
 
+// Relatório FIXO do cache local de capas (não some sozinho), no topo da aba
+// Favoritos. Mostra quantas capas já estão arquivadas em disco e o progresso.
+function setCacheStatus(msg) {
+  const el = $('#cacheStatus');
+  if (el) el.textContent = msg;
+}
+
 // Progresso visual de captura (fotos do cache + preços), ex.: "Capturando
 // fotos 12/340 · preços 3/50". Atualiza a barra de status conforme carrega.
 const progress = { photos: { done: 0, total: 0 }, prices: { done: 0, total: 0 } };
@@ -1015,11 +1022,20 @@ async function renderFavGrid() {
 
   // Pré-cache em segundo plano de TODAS as capas dos favoritos (não só as que
   // aparecem na tela), para tudo ficar arquivado sem precisar rolar a lista.
-  // Roda uma vez por sessão; reroda se a quantidade de favoritos mudar.
+  // Chamado a cada render (é idempotente: o main só baixa o que falta e mostra
+  // o relatório de quantas capas já estão no cache local, visível no app).
   const allCovers = [...new Set(favs.map((f) => f.cover).filter(Boolean))];
-  if (allCovers.length && state._prefetchedCount !== favs.length) {
-    state._prefetchedCount = favs.length;
-    Promise.resolve(api.prefetchImages(allCovers)).catch(() => {});
+  if (allCovers.length) {
+    Promise.resolve(api.prefetchImages(allCovers))
+      .then((r) => {
+        if (!r) return;
+        const rep =
+          `Cache local de capas: ${r.cached}/${r.total}` +
+          (r.missing ? ` · arquivando ${r.missing} nova(s)…` : ' — completo ✓');
+        setCacheStatus(rep);
+        api.log(`[cache] ${rep}`);
+      })
+      .catch(() => {});
   }
   visible.forEach((f) => {
     const key = favKey(f.store, f.albumId);
@@ -1504,10 +1520,12 @@ function bindEvents() {
     if (finished) {
       progress.photos.done = 0;
       progress.photos.total = 0;
+      setCacheStatus(`Cache local de capas: completo ✓ (${done} nova(s) arquivada(s) agora)`);
       setStatus(`Fotos arquivadas: ${done} nova(s). Tudo no cache local.`);
     } else {
       progress.photos.done = done;
       progress.photos.total = total;
+      setCacheStatus(`Arquivando capas no cache local: ${done}/${total}…`);
     }
     renderProgress();
   });

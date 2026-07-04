@@ -761,11 +761,11 @@ ipcMain.handle('cache:prefetchImages', async (_e, urls) => {
   });
   if (prefetchRunning) {
     console.log(`[cache] pré-cache já em andamento; ignorando novo pedido.`);
-    return { started: false, missing: missing.length };
+    return { started: false, total: list.length, cached: list.length - missing.length, missing: missing.length };
   }
   if (!missing.length) {
     console.log(`[cache] pré-cache: todas as ${list.length} imagens já estão no disco.`);
-    return { started: false, missing: 0 };
+    return { started: false, total: list.length, cached: list.length, missing: 0 };
   }
   prefetchRunning = true;
   console.log(
@@ -807,7 +807,7 @@ ipcMain.handle('cache:prefetchImages', async (_e, urls) => {
     const totalDisco = fs.existsSync(imageCacheDir) ? fs.readdirSync(imageCacheDir).length : 0;
     console.log(`[cache] pré-cache FINALIZADO. Total arquivado no disco: ${totalDisco}`);
   })();
-  return { started: true, missing: missing.length };
+  return { started: true, total: list.length, cached: list.length - missing.length, missing: missing.length };
 });
 
 /* -------------------------------------------------------------------------- */

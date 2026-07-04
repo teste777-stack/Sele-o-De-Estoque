@@ -397,6 +397,16 @@ body {
   margin: 0;
   font-size: 16px;
 }
+.cache-status {
+  margin: -6px 0 12px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(53, 200, 138, 0.1);
+  border: 1px solid rgba(53, 200, 138, 0.3);
+  color: var(--accent-2);
+  font-size: 12px;
+  font-weight: 600;
+}
 
 /* ---------------- Grade (mega grade) ---------------- */
 .grid {
