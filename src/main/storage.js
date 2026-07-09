@@ -109,11 +109,16 @@ class Storage {
       this._ensureDir();
       while (st.dirty) {
         st.dirty = false;
+        // Escrita atômica: grava em arquivo temporário e renomeia.
+        // Garante que o arquivo original nunca fica truncado/corrompido.
+        const tmp = file + '.tmp';
         try {
-          await fsp.writeFile(file, JSON.stringify(getObj()), 'utf8');
+          await fsp.writeFile(tmp, JSON.stringify(getObj()), 'utf8');
+          await fsp.rename(tmp, file);
         } catch (e) {
           // eslint-disable-next-line no-console
           console.error('Falha ao salvar', file, e && e.message);
+          try { await fsp.unlink(tmp); } catch (_) { /* ignora */ }
         }
       }
       st.running = false;
@@ -452,6 +457,17 @@ class Storage {
     return this._saveDebounced('prices', this.pricesFile, () => this._prices);
   }
 
+  /** Remove a entrada de preço do cache (força re-busca). */
+  async deleteCachedPrice(url) {
+    if (!url) return;
+    const all = this._loadPrices();
+    if (url in all) {
+      delete all[url];
+      this._prices = all;
+      await this._savePrices();
+    }
+  }
+
   /**
    * Retorna o preco em cache se ainda for utilizavel. Um preco VALIDO (ok, com
    * valor) nunca expira: e mantido para sempre e nunca re-raspado — apenas as
@@ -656,6 +672,8 @@ class Storage {
       priced: (info && info.priced) || 0,
       seen: all[key] ? !!all[key].seen : false,
       reviewed: all[key] ? !!all[key].reviewed : false,
+      newCount: all[key] ? all[key].newCount || 0 : 0,
+      checkedAt: all[key] ? all[key].checkedAt || null : null,
       updatedAt: new Date().toISOString(),
     };
     this._pricedStores = all;
@@ -680,9 +698,67 @@ class Storage {
     const key = Storage.normalizeStore(store);
     const all = this._loadPricedStores();
     if (!all[key]) return this.listPricedStores();
-    if (flag === 'seen') all[key].seen = !!value;
-    else if (flag === 'reviewed') all[key].reviewed = !!value;
+    if (flag === 'seen') {
+      all[key].seen = !!value;
+      // Tudo visto => também conta como "atualizado" (sem álbuns novos pendentes).
+      if (value) {
+        all[key].reviewed = true;
+        all[key].newCount = 0;
+      }
+    } else if (flag === 'reviewed') {
+      all[key].reviewed = !!value;
+      // Marcar como "atualizado" significa que não há álbuns novos pendentes.
+      if (value) all[key].newCount = 0;
+    }
     all[key].flagsAt = new Date().toISOString();
+    this._pricedStores = all;
+    await this._savePricedStores();
+    return this.listPricedStores();
+  }
+
+  /**
+   * Sincroniza o estado "atualizado" com o "visto": toda loja marcada como
+   * VISTA passa a contar como ATUALIZADA. Usado no arranque para corrigir
+   * lojas que já estavam vistas antes desta regra existir.
+   * @returns {Promise<number>} quantas lojas foram ajustadas.
+   */
+  async syncReviewedWithSeen() {
+    const all = this._loadPricedStores();
+    let changed = 0;
+    const now = new Date().toISOString();
+    for (const key of Object.keys(all)) {
+      const s = all[key];
+      if (s && s.seen && (!s.reviewed || s.newCount)) {
+        s.reviewed = true;
+        s.newCount = 0;
+        s.flagsAt = now;
+        changed += 1;
+      }
+    }
+    if (changed) {
+      this._pricedStores = all;
+      await this._savePricedStores();
+    }
+    return changed;
+  }
+
+  /**
+   * Registra o resultado de uma verificação de álbuns novos de uma loja.
+   * Sem novos (newCount 0) => marca "atualizado"; com novos => desmarca.
+   * @param {string} store url da loja
+   * @param {number} newCount quantidade de álbuns novos (não vistos)
+   */
+  async setPricedNewCount(store, newCount) {
+    const key = Storage.normalizeStore(store);
+    const all = this._loadPricedStores();
+    if (!all[key]) return this.listPricedStores();
+    const n = Math.max(0, Number(newCount) || 0);
+    all[key].newCount = n;
+    all[key].reviewed = n === 0;
+    // Com álbuns novos a loja não está mais totalmente vista; limpa "Visto"
+    // para não ser remarcada como "Atualizado" pela sincronização do arranque.
+    if (n > 0) all[key].seen = false;
+    all[key].checkedAt = new Date().toISOString();
     this._pricedStores = all;
     await this._savePricedStores();
     return this.listPricedStores();
@@ -722,7 +798,9 @@ class Storage {
 
   /**
    * Marca uma lista de IDs de album como vistos para a loja.
-   * Se a loja tiver links salvos, marca automaticamente como "visto".
+   * Apenas registra os IDs individuais — NÃO marca a loja como "vista"/
+   * "atualizada" por inteiro. A loja só vira "Visto/Atualizado" quando TODOS
+   * os álbuns (todas as páginas) foram abertos (ver setPricedFlag('seen')).
    * @returns {Promise<{added:number,total:number}>}
    */
   async markSeen(store, ids) {
@@ -744,15 +822,6 @@ class Storage {
     all[key] = rec;
     this._seen = all;
     await this._saveSeen();
-
-    // Auto: se a loja tem links salvos, marca-a como "visto".
-    const priced = this._loadPricedStores();
-    if (priced[key] && !priced[key].seen) {
-      priced[key].seen = true;
-      priced[key].flagsAt = now;
-      this._pricedStores = priced;
-      await this._savePricedStores();
-    }
     return { added, total: Object.keys(rec.ids).length };
   }
 

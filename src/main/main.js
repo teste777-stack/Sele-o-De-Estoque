@@ -48,8 +48,23 @@ function refererFor(url) {
 // dependerem do CDN do Yupoo (que bloqueia rajadas) e ficarem arquivadas.
 let imageCacheDir = null;
 const imgStats = { hits: 0, stored: 0, failed: 0 };
+/**
+ * Chave ESTÁVEL de uma imagem do Yupoo: protocolo + host + caminho, SEM a
+ * query string. O Yupoo anexa tokens voláteis (que mudam a cada carregamento)
+ * na URL das fotos; se eles entrarem no hash, o mesmo arquivo gera um nome
+ * novo toda vez, o cache nunca acerta e o disco só acumula (GBs) re-baixando.
+ * Usando só o caminho, cada foto sempre vira o MESMO nome fixo.
+ */
+function canonicalImgKey(remoteUrl) {
+  try {
+    const u = new URL(remoteUrl);
+    return `${u.protocol}//${u.host}${u.pathname}`;
+  } catch (_) {
+    return String(remoteUrl).split('#')[0].split('?')[0];
+  }
+}
 function imgCachePath(remoteUrl) {
-  const h = crypto.createHash('sha1').update(remoteUrl).digest('hex');
+  const h = crypto.createHash('sha1').update(canonicalImgKey(remoteUrl)).digest('hex');
   let ext = '.jpg';
   const m = String(remoteUrl).match(/\.(jpe?g|png|webp|gif)(?:\?|$)/i);
   if (m) ext = '.' + m[1].toLowerCase().replace('jpeg', 'jpg');
@@ -71,30 +86,45 @@ function decodeYcimg(reqUrl) {
   return Buffer.from(b64, 'base64').toString('utf8');
 }
 
-// Fila de downloads com concorrência limitada: o Yupoo segura/limita muitas
-// conexões simultâneas (imagens ficavam pendentes "pela metade"). Baixamos
-// poucas por vez e reaproveitamos downloads em andamento (dedupe).
-const MAX_DL = 5;
-let activeDl = 0;
-const dlQueue = [];
-const inflight = new Map(); // remote -> Promise<void>
-function acquireSlot() {
-  if (activeDl < MAX_DL) {
-    activeDl += 1;
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => dlQueue.push(resolve));
+// Downloads separados em dois canais para garantir prioridade:
+//  FG (foreground) — ycimg:// handler: imagens visíveis na tela (prioridade máxima)
+//  BG (background) — prefetchImages: pré-cache em segundo plano
+// Cada canal tem seu próprio contador/fila; assim o prefetch nunca bloqueia
+// as imagens que o usuário já está vendo.
+const MAX_FG = 4; // slots para downloads sob demanda (visíveis)
+const MAX_BG = 2; // slots para prefetch em background
+let activeFg = 0, activeBg = 0;
+const fgQueue = [], bgQueue = [];
+const inflight = new Map(); // file -> Promise<void>  (dedupe por arquivo)
+
+function acquireFg() {
+  if (activeFg < MAX_FG) { activeFg++; return Promise.resolve(); }
+  return new Promise((r) => fgQueue.push(r));
 }
-function releaseSlot() {
-  const next = dlQueue.shift();
-  if (next) next();
-  else activeDl = Math.max(0, activeDl - 1);
+function releaseFg() {
+  const next = fgQueue.shift();
+  if (next) next(); else activeFg = Math.max(0, activeFg - 1);
 }
+function acquireBg() {
+  if (activeBg < MAX_BG) { activeBg++; return Promise.resolve(); }
+  return new Promise((r) => bgQueue.push(r));
+}
+function releaseBg() {
+  const next = bgQueue.shift();
+  if (next) next(); else activeBg = Math.max(0, activeBg - 1);
+}
+
+// Mantém retrocompatibilidade (ensureCached usa FG por padrão)
+const MAX_DL = MAX_FG;
+function acquireSlot() { return acquireFg(); }
+function releaseSlot() { releaseFg(); }
 
 /** Garante que a imagem esteja em disco (baixa uma vez, com limite/ dedupe). */
 function ensureCached(remote, file) {
   if (fs.existsSync(file)) return Promise.resolve();
-  if (inflight.has(remote)) return inflight.get(remote);
+  // Dedupe pelo ARQUIVO de destino (nome fixo), não pela URL remota: variantes
+  // da mesma foto com tokens diferentes apontam para o mesmo arquivo.
+  if (inflight.has(file)) return inflight.get(file);
   const p = (async () => {
     await acquireSlot();
     try {
@@ -112,11 +142,65 @@ function ensureCached(remote, file) {
       );
     } finally {
       releaseSlot();
-      inflight.delete(remote);
+      inflight.delete(file);
     }
   })();
-  inflight.set(remote, p);
+  inflight.set(file, p);
   return p;
+}
+
+/**
+ * Reúne as URLs de imagem que precisam existir em disco para o favorito ficar
+ * disponível offline. Arquiva APENAS a thumbnail (capa) do produto — NÃO todas
+ * as fotos do álbum — pois só a miniatura é exibida na grade de favoritos.
+ * @param {object} fav registro do favorito.
+ * @returns {string[]} URLs remotas (yupoo) únicas.
+ */
+function favImageUrls(fav) {
+  const urls = new Set();
+  const add = (u) => {
+    if (u && typeof u === 'string' && /^https?:\/\//i.test(u)) urls.add(u);
+  };
+  if (fav) {
+    // Somente a thumbnail do produto: capa do favorito ou, na falta dela,
+    // a miniatura da primeira foto do álbum.
+    if (fav.cover) add(fav.cover);
+    else {
+      const first = (fav.photos || [])[0];
+      if (first) add(first.thumb || first.big || first.origin);
+    }
+  }
+  return [...urls];
+}
+
+/**
+ * Baixa e arquiva em disco (image-cache) todas as imagens de um favorito,
+ * respeitando a fila de downloads (5 por vez). Roda em segundo plano.
+ * @param {object} fav registro do favorito.
+ * @returns {Promise<{total:number,cached:number,failed:number}>}
+ */
+async function archiveFavoriteImages(fav) {
+  const list = favImageUrls(fav);
+  if (!list.length || !imageCacheDir) return { total: 0, cached: 0, failed: 0 };
+  let cached = 0;
+  let failed = 0;
+  async function worker(queue) {
+    while (queue.length) {
+      const remote = queue.shift();
+      try {
+        await ensureCached(remote, imgCachePath(remote));
+        cached += 1;
+      } catch (_) {
+        failed += 1;
+      }
+    }
+  }
+  const queue = [...list];
+  await Promise.all(Array.from({ length: MAX_DL }, () => worker(queue)));
+  console.log(
+    `[cache] favorito arquivado: ${cached}/${list.length} imagem(ns) em disco (${failed} falha(s)).`
+  );
+  return { total: list.length, cached, failed };
 }
 
 /** Handler do esquema ycimg: serve do disco ou baixa (com Referer) e arquiva. */
@@ -211,10 +295,43 @@ if (!gotSingleInstanceLock) {
 
 app.whenReady().then(() => {
   storage = new Storage(app.getPath('userData'));
-  // Pasta do cache local de imagens (arquivo permanente das fotos).
-  imageCacheDir = path.join(app.getPath('userData'), 'image-cache');
+  // Corrige lojas já marcadas como "Visto" para também contarem como
+  // "Atualizado" (regra: tudo visto = atualizado). Roda uma vez no arranque.
+  Promise.resolve(storage.syncReviewedWithSeen()).catch(() => {});
+  // Pasta do cache local de imagens (arquivo permanente das fotos), agora
+  // DENTRO da pasta do projeto (ao lado do package.json) em vez do AppData.
+  imageCacheDir = path.join(app.getAppPath(), 'image-cache');
   try {
     fs.mkdirSync(imageCacheDir, { recursive: true });
+  } catch (_) {
+    /* ignora */
+  }
+  // Migração única: move as imagens já arquivadas no AppData para a nova pasta
+  // do projeto, para não precisar baixar tudo de novo.
+  try {
+    const oldDir = path.join(app.getPath('userData'), 'image-cache');
+    if (oldDir !== imageCacheDir && fs.existsSync(oldDir)) {
+      const files = fs.readdirSync(oldDir);
+      let moved = 0;
+      for (const name of files) {
+        const from = path.join(oldDir, name);
+        const to = path.join(imageCacheDir, name);
+        if (fs.existsSync(to)) continue;
+        try {
+          fs.renameSync(from, to);
+          moved += 1;
+        } catch (_) {
+          try {
+            fs.copyFileSync(from, to);
+            fs.unlinkSync(from);
+            moved += 1;
+          } catch (_) {
+            /* ignora arquivo individual */
+          }
+        }
+      }
+      if (moved) console.log(`[cache] migração: ${moved} imagem(ns) movida(s) do AppData para ${imageCacheDir}`);
+    }
   } catch (_) {
     /* ignora */
   }
@@ -467,6 +584,11 @@ ipcMain.handle(
   'favorites:add',
   wrap(async (fav) => {
     const rec = await storage.addFavorite(fav);
+    // Arquiva em disco APENAS a thumbnail (capa) do produto, em segundo plano,
+    // para o favorito ficar disponível offline sem baixar todas as fotos.
+    archiveFavoriteImages(rec).catch((e) =>
+      console.log(`[cache] falha ao arquivar favorito: ${e && e.message}`)
+    );
     return { favorite: rec, all: storage.listFavorites() };
   })
 );
@@ -585,13 +707,54 @@ ipcMain.handle(
     const map = {};
     for (const it of list) {
       if (!it || it.title == null) continue;
+      // Verifica se já temos este preço salvo em disco (chave = url do álbum).
+      const key = it.url || `title:${it.id}`;
+      const cached = storage.getCachedPrice(key);
+      if (cached && cached.ok) {
+        map[it.id] = cached;
+        continue;
+      }
       const r = await scraper.priceFromText(it.title);
       if (r) {
-        r.url = it.url || `title:${it.id}`;
+        r.url = key;
         map[it.id] = r;
+        // Persiste em prices.json para sobreviver ao restart.
+        storage.setCachedPrice(key, r).catch(() => {});
       }
     }
     return map;
+  })
+);
+
+/**
+ * Força re-busca dos preços para uma lista de URLs, ignorando o cache de falhas.
+ * Usado pelo sweep de Superbuy nos favoritos e pelo botão "Atualizar preço".
+ */
+ipcMain.handle(
+  'prices:forceRefetch',
+  wrap(async (urls) => {
+    const list = Array.isArray(urls) ? [...new Set(urls.filter(Boolean))] : [];
+    // Remove entradas com ok=false ou sem preço do cache, para forçar re-busca.
+    for (const url of list) {
+      const cached = storage.getCachedPrice(url);
+      if (!cached || !cached.ok || cached.price == null) {
+        await storage.deleteCachedPrice(url).catch(() => {});
+      }
+    }
+    const results = [];
+    await scraper.fetchPrices(
+      list,
+      (done, total, item) => {
+        if (item && item.url) storage.setCachedPrice(item.url, item).catch(() => {});
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('prices:progress', { done, total, item });
+        }
+        results.push(item);
+      },
+      3,
+      shouldCancelLoading
+    );
+    return { count: results.length, results };
   })
 );
 
@@ -717,6 +880,68 @@ ipcMain.handle(
   wrap(async (store, flag, value) => storage.setPricedFlag(store, flag, value))
 );
 
+/**
+ * Varre a grade principal (todas as páginas) de cada loja salva procurando
+ * álbuns NOVOS (ids ainda não vistos). Se achar novos, desmarca "Atualizado"
+ * daquela loja e registra a contagem; se não achar nenhum, marca "Atualizado".
+ * Emite progresso em 'checknew:progress'.
+ */
+ipcMain.handle(
+  'stores:checkNew',
+  wrap(async () => {
+    beginLoading();
+    const stores = storage.listPricedStores();
+    const total = stores.length;
+    let done = 0;
+    const results = [];
+    const emit = (payload) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('checknew:progress', payload);
+      }
+    };
+
+    for (const s of stores) {
+      if (shouldCancelLoading()) break;
+      const store = s.store;
+      const entry = { store, ok: false, newCount: 0, total: 0 };
+      try {
+        const seenRec = storage.getSeen(store);
+        const seenIds = new Set(Object.keys(seenRec.ids || {}));
+        const allIds = new Set();
+        let page = 1;
+        let totalPages = 1;
+        const MAX_PAGES = 60; // trava de segurança contra lojas enormes/erro
+        while (page <= totalPages && page <= MAX_PAGES) {
+          if (shouldCancelLoading()) break;
+          let res;
+          try {
+            res = await withTimeout(scraper.fetchAlbums(store, page), 9000, 'sem acesso');
+          } catch (err) {
+            if (page === 1) throw err; // loja inacessível -> erro e pula
+            break; // páginas seguintes falharam: para por aqui
+          }
+          if (page === 1) totalPages = res.totalPages || 1;
+          for (const a of res.albums) allIds.add(String(a.id));
+          if (page >= totalPages) break;
+          page += 1;
+        }
+        const newIds = [...allIds].filter((id) => !seenIds.has(id));
+        entry.total = allIds.size;
+        entry.newCount = newIds.length;
+        entry.ok = true;
+        await storage.setPricedNewCount(store, newIds.length);
+      } catch (err) {
+        entry.error = err.message || String(err);
+      }
+      done += 1;
+      results.push(entry);
+      emit({ done, total, store, entry });
+    }
+
+    return { count: results.length, results };
+  })
+);
+
 ipcMain.handle(
   'seen:get',
   wrap(async (store) => storage.getSeen(store))
@@ -826,8 +1051,38 @@ ipcMain.handle('cache:prefetchImages', async (_e, urls) => {
         }
       }
     }
-    // Vários workers pegam da mesma lista; a fila interna limita a 5 downloads.
-    await Promise.all(Array.from({ length: MAX_DL }, () => worker()));
+    // Workers de background usam canal BG (2 slots), deixando FG livre para
+    // o ycimg:// handler servir as imagens visíveis sem esperar o prefetch.
+    async function bgWorker() {
+      while (idx < missing.length) {
+        const remote = missing[idx++];
+        const file = imgCachePath(remote);
+        if (fs.existsSync(file)) { done++; sendProgress(done, false); continue; }
+        if (inflight.has(file)) {
+          try { await inflight.get(file); } catch (_) {}
+          done++; sendProgress(done, false); continue;
+        }
+        const p = (async () => {
+          await acquireBg();
+          try {
+            if (!fs.existsSync(file)) {
+              const res = await axios.get(remote, {
+                responseType: 'arraybuffer', timeout: 15000,
+                headers: { Referer: refererFor(remote), 'User-Agent': USER_AGENT },
+              });
+              fs.writeFileSync(file, Buffer.from(res.data));
+              imgStats.stored++;
+            }
+          } finally { releaseBg(); inflight.delete(file); }
+        })();
+        inflight.set(file, p);
+        try { await p; } catch (_) {}
+        done++; sendProgress(done, false);
+        if (done % 200 === 0 || done === missing.length)
+          console.log(`[cache] pré-cache: ${done}/${missing.length} concluído`);
+      }
+    }
+    await Promise.all(Array.from({ length: MAX_BG }, () => bgWorker()));
     prefetchRunning = false;
     sendProgress(done, true);
     const totalDisco = fs.existsSync(imageCacheDir) ? fs.readdirSync(imageCacheDir).length : 0;
@@ -865,17 +1120,17 @@ ipcMain.handle(
   })
 );
 
-// Garante que o navegador seja fechado ao sair do app.
-app.on('before-quit', async () => {
-  try {
-    if (storage) await storage.flushSaves();
-  } catch (_) {
-    /* ignora */
-  }
-  try {
-    await scraper.browser.closeBrowser();
-    await scraper.browser.closePriceBrowser();
-  } catch (_) {
-    /* ignora */
-  }
+// Garante gravações pendentes e fecha o navegador antes de sair.
+// IMPORTANTE: before-quit não aguarda Promises; usamos event.preventDefault()
+// para cancelar o quit, fazemos o trabalho assíncrono e depois app.exit().
+let _quitting = false;
+app.on('before-quit', (event) => {
+  if (_quitting) return; // segunda chamada (após app.exit) — deixa passar
+  event.preventDefault();
+  _quitting = true;
+  Promise.allSettled([
+    storage ? storage.flushSaves() : Promise.resolve(),
+    scraper.browser.closeBrowser().catch(() => {}),
+    scraper.browser.closePriceBrowser().catch(() => {}),
+  ]).finally(() => app.exit(0));
 });

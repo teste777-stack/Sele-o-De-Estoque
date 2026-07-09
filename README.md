@@ -19,30 +19,37 @@ baixar álbuns de lojas **Yupoo** de forma **manual e visual**.
 - **Badge de link antes de abrir** — ative _"Verificar links da página"_ para
   descobrir, sem abrir o álbum, quais têm link fonte (`✓ tem link` / `— sem link`).
 - **Detecção de preço pelo título** — quando o nome do álbum contém um valor
-  (ex.: `CNY 128`, `¥99`), o preço é exibido direto na grade.
+  (ex.: `CNY 128`, `¥99`), o preço é exibido direto na grade e **salvo em disco**.
 - **Busca de preço no link fonte** — abre o link (weidian/mulebuy/1688 etc.) e
-  extrai o preço, convertendo para BRL/USD.
-- **Taobao/Tmall ignorados** — não são acessados (retornam como "ignorado").
-- **Cache de 24h** — preços e links ficam salvos por 24h para evitar re-busca.
-  **Todo preço buscado é sempre armazenado** (gravação garantida, ver abaixo).
+  extrai o preço, convertendo para BRL/USD. **Todo preço é salvo em `prices.json`
+  e persiste entre sessões.**
+- **Weidian via Superbuy** — Weidian usa HTTP/2 e rejeita raspagem direta com
+  Puppeteer; o app usa o Superbuy como proxy para obter o preço sem erros.
+- **Taobao/Tmall via Superbuy** — idem; o Superbuy resolve o produto e expõe o preço.
+- **Cache permanente** — preços válidos ficam salvos para sempre (sem re-raspagem).
+  Falhas expiram em 24h. Gravação atômica (nunca corrompe o arquivo ao fechar).
+- **Botão ↻ Preço** — em cada card de favorito, força re-busca imediata do preço
+  (apaga a falha do cache e tenta novamente, inclusive via Superbuy).
+- **Sweep automático Superbuy** — ao abrir a aba Favoritos, itens sem preço válido
+  são enviados em segundo plano para o fluxo Superbuy automaticamente.
 
 ### Favoritos (armazenamento principal)
 - Arquive álbuns; guarda título, capa, contagem, **categoria de origem**, links
-  fonte e a lista de fotos. Persistido em `favorites.json`.
-- **Fila em segundo plano** — favoritar/desfavoritar é otimista (a estrela muda
-  na hora) e o arquivamento acontece em segundo plano, sem travar a interface.
+  fonte e a lista de fotos. Persistido em `favorites.json` (gravação atômica).
+- **16 000+ favoritos suportados** — paginação de 120 cards por vez evita congelamento.
+- **Fila em segundo plano** — favoritar/desfavoritar é otimista e não trava a UI.
 - **Tags** — organize favoritos por categoria/marca e filtre por elas.
 - **Remoção instantânea** — ao excluir, o card some na hora (sem loading).
 
 ### "Já visto" (novo/visto)
 - Cada álbum recebe badge **novo** ou **✓ visto** (canto superior direito).
 - Os IDs vistos são registrados por loja em `seen-albums.json`.
-- Marcar uma **loja inteira como "Visto"** (na aba Verificar) faz **todos** os
-  álbuns dela contarem como vistos, inclusive os de categoria e favoritos.
+- Marcar uma **loja inteira como "Visto"** faz todos os álbuns dela contarem como
+  vistos, inclusive os de categoria e favoritos.
 
 ### Fotos e sessão
-- **Salvar fotos** — baixa todas as imagens em resolução original
-  (`data-origin-src`) para uma pasta escolhida, com um `_info.json` de manifesto.
+- **Salvar fotos** — baixa todas as imagens em resolução original para uma pasta
+  escolhida, com um `_info.json` de manifesto.
 - **Links da sessão** — todos os links acessados ficam registrados e exportáveis.
 
 ---
@@ -58,6 +65,7 @@ Modo com logs:
 
 ```powershell
 npm run dev
+```
 ```
 
 ---

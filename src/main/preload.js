@@ -45,6 +45,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Precos dos links de compra
   fetchPrices: (urls) => invoke('links:fetchPrices', urls),
+  forceRefetchPrices: (urls) => invoke('prices:forceRefetch', urls),
   cancelLoading: () => invoke('loading:cancel'),
   getCachedPrices: (urls) => invoke('prices:getCached', urls),
   pricesFromTitles: (items) => invoke('prices:fromTitles', items),
@@ -59,6 +60,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   listPricedStores: () => invoke('bulk:listPriced'),
   removePricedStore: (store) => invoke('bulk:removePriced', store),
   setPricedFlag: (store, flag, value) => invoke('bulk:setPricedFlag', store, flag, value),
+  checkNewStores: () => invoke('stores:checkNew'),
+  onCheckNewProgress: (cb) => {
+    const listener = (_e, payload) => cb(payload);
+    ipcRenderer.on('checknew:progress', listener);
+    return () => ipcRenderer.removeListener('checknew:progress', listener);
+  },
   getSeen: (store) => invoke('seen:get', store),
   markSeen: (store, ids) => invoke('seen:mark', store, ids),
   onBulkProgress: (cb) => {

@@ -10,6 +10,8 @@ npm-debug.log*
 *.local.json
 /data/
 /userData/
+# Cache local de imagens arquivadas (fotos dos favoritos) — pode ter muitos GB
+/image-cache/
 
 # Saídas de build / empacotamento
 dist/

@@ -220,19 +220,6 @@ async function ensurePriceBrowser() {
   if (priceBrowser) return priceBrowser;
   const pptr = loadPuppeteer();
 
-  // 1) Brave ja aberto (mais realista: sessao/cookies do usuario).
-  try {
-    priceBrowser = await pptr.connect({
-      browserURL: config.browserURL,
-      defaultViewport: null,
-    });
-    priceConnected = true;
-    priceKind = 'connect';
-    return priceBrowser;
-  } catch (_) {
-    /* segue para o proximo nivel */
-  }
-
   const args = [
     '--no-sandbox',
     '--disable-setuid-sandbox',
@@ -240,8 +227,10 @@ async function ensurePriceBrowser() {
     '--lang=pt-BR',
   ];
 
-  // 2) Brave instalado no sistema (navegador real).
-  const bp = detectBravePath();
+  // 1) Brave instalado no sistema, iniciado PELO Puppeteer (motor do Brave).
+  //    E a via preferida: usa o engine do Brave sem depender de um Brave
+  //    ja aberto com porta de debug.
+  const bp = config.bravePath || detectBravePath();
   if (bp) {
     priceBrowser = await pptr.launch({
       headless: false,
@@ -254,7 +243,20 @@ async function ensurePriceBrowser() {
     return priceBrowser;
   }
 
-  // 3) Chromium empacotado.
+  // 2) Fallback: conecta a um Brave JA ABERTO com --remote-debugging-port.
+  try {
+    priceBrowser = await pptr.connect({
+      browserURL: config.browserURL,
+      defaultViewport: null,
+    });
+    priceConnected = true;
+    priceKind = 'connect';
+    return priceBrowser;
+  } catch (_) {
+    /* segue para o proximo nivel */
+  }
+
+  // 3) Ultimo recurso: Chromium empacotado (pode ser bloqueado por anti-bot).
   priceBrowser = await pptr.launch({
     headless: true,
     defaultViewport: { width: 1366, height: 900 },
@@ -266,23 +268,108 @@ async function ensurePriceBrowser() {
 }
 
 /**
+ * Detecta se a pagina atual e um desafio/captcha do Cloudflare
+ * ("Just a moment...", Turnstile, "verify you are human", etc.).
+ * @param {import('puppeteer').Page} page
+ * @returns {Promise<boolean>}
+ */
+async function isCloudflareChallenge(page) {
+  try {
+    return await page.evaluate(() => {
+      const t = (document.title || '').toLowerCase();
+      if (
+        t.includes('just a moment') ||
+        t.includes('attention required') ||
+        t.includes('um momento') ||
+        t.includes('acesso negado')
+      ) {
+        return true;
+      }
+      if (
+        document.querySelector(
+          '#challenge-form, #challenge-running, #cf-challenge-running, ' +
+            '.cf-turnstile, iframe[src*="challenges.cloudflare.com"], ' +
+            'iframe[title*="Cloudflare"], #cf-please-wait'
+        )
+      ) {
+        return true;
+      }
+      const body = ((document.body && document.body.innerText) || '').toLowerCase();
+      return (
+        body.includes('verify you are human') ||
+        body.includes('checking your browser') ||
+        body.includes('verificando seu navegador') ||
+        body.includes('verifique se voc') // "verifique se voce e humano"
+      );
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Se um captcha do Cloudflare aparecer, TRAVA aqui aguardando o usuario
+ * resolve-lo manualmente na janela do Brave. So retorna quando o desafio
+ * some (ou apos o limite maximo). Nunca fecha a pagina enquanto espera.
+ * @param {import('puppeteer').Page} page
+ * @param {object} [opts]
+ * @param {number} [opts.pollMs]  intervalo entre verificacoes (default 2000)
+ * @param {number} [opts.maxMs]   tempo maximo de espera (default 15 min)
+ * @returns {Promise<boolean>} true se houve desafio (resolvido/expirado)
+ */
+async function waitForManualCaptcha(page, opts = {}) {
+  const pollMs = opts.pollMs || 2000;
+  const maxMs = opts.maxMs || 15 * 60 * 1000;
+  const start = Date.now();
+  let sawChallenge = false;
+
+  while (Date.now() - start < maxMs) {
+    const challenge = await isCloudflareChallenge(page);
+    if (!challenge) {
+      if (sawChallenge) {
+        // Desafio resolvido: aguarda o conteudo real carregar.
+        await page.waitForNetworkIdle({ idleTime: 800, timeout: 15000 }).catch(() => {});
+      }
+      return sawChallenge;
+    }
+    if (!sawChallenge) {
+      sawChallenge = true;
+      console.log(
+        '[preco] Captcha Cloudflare detectado — RESOLVA MANUALMENTE na janela do Brave. ' +
+          'Aguardando ate ser resolvido...'
+      );
+    }
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  console.log('[preco] Tempo de espera do captcha esgotado.');
+  return sawChallenge;
+}
+
+/**
  * Abre a URL num navegador "realista" e devolve o HTML renderizado.
  * @param {string} url
  * @param {object} [opts]
  * @param {string} [opts.waitFor] seletor CSS a aguardar
  * @param {number} [opts.timeout] ms (default 45000)
+ * @param {number} [opts.captchaMaxMs] tempo maximo aguardando captcha manual
  * @returns {Promise<{html:string, engine:string}>}
  */
-async function renderPricePage(url, opts = {}) {
+async function renderPricePageInner(url, opts = {}) {
   const b = await ensurePriceBrowser();
   const page = await b.newPage();
   try {
     await page.setUserAgent(USER_AGENT);
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' });
-    await page.goto(url, {
-      waitUntil: 'networkidle2',
-      timeout: opts.timeout || 45000,
-    });
+    // O goto pode "estourar" o timeout enquanto o Cloudflare desafia; nao
+    // deixamos isso abortar: seguimos para aguardar o captcha manual.
+    await page
+      .goto(url, {
+        waitUntil: 'networkidle2',
+        timeout: opts.timeout || 45000,
+      })
+      .catch(() => {});
+    // Se cair num captcha do Cloudflare, trava aguardando resolucao manual.
+    await waitForManualCaptcha(page, { maxMs: opts.captchaMaxMs });
     if (opts.waitFor) {
       await page.waitForSelector(opts.waitFor, { timeout: 8000 }).catch(() => {});
     }
@@ -291,6 +378,24 @@ async function renderPricePage(url, opts = {}) {
   } finally {
     await page.close().catch(() => {});
   }
+}
+
+/**
+ * Fila SERIAL de renderizacao de preco: SO um render por vez. Assim, se cair
+ * um captcha do Cloudflare, as demais buscas ESPERAM (nao abrem novas abas) ate
+ * a primeira ser resolvida manualmente. Resolver a primeira normalmente libera
+ * o cookie do Cloudflare para a sessao inteira do Brave, e as proximas passam
+ * direto (voltando a travar so se um novo captcha aparecer).
+ * @type {Promise<any>}
+ */
+let priceRenderChain = Promise.resolve();
+
+/** Wrapper serializado de {@link renderPricePageInner}. */
+function renderPricePage(url, opts = {}) {
+  const run = priceRenderChain.then(() => renderPricePageInner(url, opts));
+  // Mantem a cadeia viva mesmo se um render falhar.
+  priceRenderChain = run.catch(() => {});
+  return run;
 }
 
 /** Fecha (ou desconecta) o navegador de precos. */

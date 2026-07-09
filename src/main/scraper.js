@@ -465,6 +465,17 @@ function priceDomain(url) {
   return 'other';
 }
 
+/**
+ * Monta a URL da pagina de compra do Superbuy para um link de produto.
+ * O Superbuy resolve o link (Taobao/Tmall/etc.) e exibe o preco, servindo de
+ * proxy para produtos que bloqueiam raspagem direta (ex.: Taobao).
+ * Ex.: https://www.superbuy.com/en/page/buy/?url=<link-do-produto-codificado>
+ * @param {string} productUrl
+ */
+function superbuyBuyUrl(productUrl) {
+  return 'https://www.superbuy.com/en/page/buy/?url=' + encodeURIComponent(productUrl);
+}
+
 const CURRENCY_MAP = [
   { re: /(?:R\$)/, code: 'BRL' },
   { re: /(?:US\$|USD|\$)/, code: 'USD' },
@@ -503,6 +514,33 @@ function parseAmount(text) {
 }
 
 /**
+ * Extrai o preco do Superbuy SOMENTE da estrutura fixa da pagina de compra
+ * (.price-content). Retorna null se o elemento nao existir — isso e proposital:
+ * no fetch HTTP a SPA vem sem o preco, entao null forca o fallback para o Brave.
+ * Ex.: <i class="goods-rmb">US $</i><strong class="goods-txt">50.9</strong>
+ *      <p class="foreign-currency">CN ￥<span>319</span></p>
+ * @returns {{price:number,currency:string,raw:string}|null}
+ */
+function superbuyStructuredPrice($) {
+  const pc = $('.goods-price-tool .price-content, .price-content').first();
+  if (!pc.length) return null;
+  const rmbLabel = pc.find('.goods-rmb').first().text().trim(); // "US $"
+  const mainTxt = pc.find('.goods-txt').first().text().trim(); // "50.9"
+  const amount = parseAmount(mainTxt);
+  if (amount != null && amount > 0) {
+    const currency = guessCurrency(rmbLabel) || guessCurrency(mainTxt) || 'USD';
+    return { price: amount, currency, raw: `${rmbLabel} ${mainTxt}`.trim().slice(0, 60) };
+  }
+  // Fallback: valor original em CN ￥ (.foreign-currency span).
+  const cnyTxt = pc.find('.foreign-currency span').first().text().trim(); // "319"
+  const cnyAmount = parseAmount(cnyTxt);
+  if (cnyAmount != null && cnyAmount > 0) {
+    return { price: cnyAmount, currency: 'CNY', raw: `CN¥ ${cnyTxt}`.slice(0, 60) };
+  }
+  return null;
+}
+
+/**
  * Tenta extrair {price, currency, raw} de um documento cheerio.
  * Combina JSON-LD, meta-tags, seletores por dominio e regex de fallback.
  */
@@ -514,7 +552,13 @@ function extractPrice($, domain) {
     return { price: amount, currency, raw: String(raw).trim().slice(0, 60) };
   };
 
-  // 0) Weidian: JSON server-side injetado (fonte mais confiavel).
+  // 0) Superbuy: estrutura fixa da pagina de compra (.price-content).
+  if (domain === 'superbuy') {
+    const s = superbuyStructuredPrice($);
+    if (s) return s;
+  }
+
+  // 0b) Weidian: JSON server-side injetado (fonte mais confiavel).
   if (domain === 'weidian') {
     const obj = $('#__rocker-render-inject__').attr('data-obj');
     if (obj) {
@@ -611,6 +655,18 @@ function extractPrice($, domain) {
     ],
     mulebuy: ['[class*="price"]', '[class*="Price"]', '.product-price', '.goods-price'],
     x1688: ['.price', '[class*="price"]'],
+    superbuy: [
+      '.good-price',
+      '.J_good_price',
+      '.price-num',
+      '.good-detail .price',
+      '.goods-price',
+      '[class*="goodPrice"]',
+      '[class*="good-price"]',
+      '[class*="priceNum"]',
+      '[class*="price"]',
+      '[class*="Price"]',
+    ],
     other: ['[class*="price"]', '[class*="Price"]'],
   };
   for (const sel of domainSels[domain] || domainSels.other) {
@@ -638,10 +694,16 @@ function extractPrice($, domain) {
 
 let ratesCache = null; // { ts, rates } com base em USD
 
-/** Busca (e cacheia por 6h) as cotacoes com base em USD. */
+/** Busca (e cacheia por 6h) as cotacoes com base em USD.
+ *  Falhas tambem sao cacheadas por 30s para evitar que um loop de itens
+ *  (ex.: 120 favoritos) dispare 120 requisicoes de 12s quando offline. */
 async function getRates() {
   const SIX_HOURS = 6 * 60 * 60 * 1000;
-  if (ratesCache && Date.now() - ratesCache.ts < SIX_HOURS) return ratesCache.rates;
+  const FAIL_TTL = 30 * 1000; // retentar falha so apos 30s
+  if (ratesCache) {
+    if (ratesCache.rates && Date.now() - ratesCache.ts < SIX_HOURS) return ratesCache.rates;
+    if (!ratesCache.rates && Date.now() - ratesCache.ts < FAIL_TTL) return null;
+  }
   try {
     const res = await axios.get('https://open.er-api.com/v6/latest/USD', {
       timeout: 12000,
@@ -649,11 +711,13 @@ async function getRates() {
     });
     if (res.data && res.data.rates) {
       ratesCache = { ts: Date.now(), rates: res.data.rates };
+    } else {
+      ratesCache = { ts: Date.now(), rates: null }; // cacheia falha
     }
   } catch (_) {
-    /* mantem cache antigo se houver */
+    ratesCache = { ts: Date.now(), rates: null }; // cacheia falha
   }
-  return ratesCache ? ratesCache.rates : null;
+  return ratesCache.rates;
 }
 
 /** Converte um valor de uma moeda para outra usando cotacoes base-USD. */
@@ -764,23 +828,90 @@ async function fetchPrice(url) {
     return result;
   };
 
-  // Taobao bloqueia raspagem e sempre falha: nao tentamos acessa-lo.
+  // Taobao/Tmall bloqueiam raspagem direta. Usamos o Superbuy como proxy:
+  // abrimos a pagina de compra do Superbuy com o link do produto e lemos o preco.
   if (domain === 'taobao') {
-    return { ...result, engine: 'skip', error: 'Taobao não é acessado (ignorado).' };
-  }
+    const buyUrl = superbuyBuyUrl(url);
 
-  // 1) Tentativa HTTP (rapida). Pulada no Taobao (quase sempre bloqueia).
-  if (domain !== 'taobao') {
+    // 1) Superbuy via HTTP (rapido, sem navegador). So aceitamos o preco se a
+    //    ESTRUTURA exata (.price-content .goods-txt) vier no HTML — evita falso
+    //    positivo de fallback. Se nao vier, cai para o navegador Brave.
     try {
       const client = makeClient();
-      const res = await client.get(url, { timeout: 15000 });
+      const res = await client.get(buyUrl, { timeout: 15000 });
       const $ = cheerio.load(res.data);
-      const p = extractPrice($, domain);
+      const p = superbuyStructuredPrice($);
       if (p && p.price != null) {
-        return finalize({ ...p, ok: true, engine: 'http' });
+        return finalize({ ...p, ok: true, engine: 'superbuy-http', source: 'superbuy' });
       }
     } catch (_) {
-      /* segue para o navegador */
+      /* Superbuy HTTP falhou/bloqueou -> segue para o navegador Brave */
+    }
+
+    // 2) Superbuy via navegador Brave (Puppeteer). Trata captcha manual e
+    //    renderiza a pagina (SPA) para ler o preco. Extração ESTRITA: só o
+    //    preço da estrutura oficial do Superbuy (sem fallback genérico).
+    try {
+      const { html, engine } = await browser.renderPricePage(buyUrl, {
+        waitFor: '.goods-price-tool .goods-txt, .price-content .goods-txt, .goods-txt',
+        timeout: 60000,
+      });
+      const $ = cheerio.load(html);
+      const p = superbuyStructuredPrice($);
+      if (p && p.price != null) {
+        return finalize({ ...p, ok: true, engine: `superbuy:${engine}`, source: 'superbuy' });
+      }
+      return {
+        ...result,
+        engine: `superbuy:${engine}`,
+        error: 'Preço não encontrado no Superbuy.',
+      };
+    } catch (err) {
+      return { ...result, error: `Superbuy: ${err.message}` };
+    }
+  }
+
+  // 1) Tentativa HTTP (rapida).
+  try {
+    const client = makeClient();
+    const res = await client.get(url, { timeout: 15000 });
+    const $ = cheerio.load(res.data);
+    const p = extractPrice($, domain);
+    if (p && p.price != null) {
+      return finalize({ ...p, ok: true, engine: 'http' });
+    }
+  } catch (_) {
+    /* segue para o navegador (se permitido) */
+  }
+
+  // Weidian usa HTTP/2 e rejeita o Puppeteer direto.
+  // Fallback: Superbuy como proxy (HTTP primeiro, depois navegador).
+  if (domain === 'weidian') {
+    const buyUrl = superbuyBuyUrl(url);
+    try {
+      const client = makeClient();
+      const res = await client.get(buyUrl, { timeout: 15000 });
+      const $sb = cheerio.load(res.data);
+      const p = superbuyStructuredPrice($sb);
+      if (p && p.price != null) {
+        return finalize({ ...p, ok: true, engine: 'superbuy-http', source: 'superbuy' });
+      }
+    } catch (_) {
+      /* segue para navegador Superbuy */
+    }
+    try {
+      const { html: sbHtml, engine: sbEngine } = await browser.renderPricePage(buyUrl, {
+        waitFor: '.goods-price-tool .goods-txt, .price-content .goods-txt, .goods-txt',
+        timeout: 60000,
+      });
+      const $sb2 = cheerio.load(sbHtml);
+      const p = superbuyStructuredPrice($sb2);
+      if (p && p.price != null) {
+        return finalize({ ...p, ok: true, engine: `superbuy:${sbEngine}`, source: 'superbuy' });
+      }
+      return { ...result, engine: `superbuy:${sbEngine}`, error: 'Preço não encontrado no Superbuy (Weidian).' };
+    } catch (err) {
+      return { ...result, error: `Superbuy (Weidian): ${err.message}` };
     }
   }
 

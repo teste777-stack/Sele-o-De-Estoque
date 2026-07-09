@@ -21,6 +21,7 @@ const state = {
   tags: [], // catalogo de tags {name, kind}
   favList: [], // favoritos carregados (para filtrar sem refetch)
   tagFilter: new Set(), // tags selecionadas no filtro de favoritos
+  favPage: 1,           // página atual dos favoritos (paginação)
   selectedFavs: new Set(), // favoritos marcados para atribuicao em massa de tags
   titlePrices: {}, // precos detectados no nome do album, por id/favKey
   favQueue: [], // fila de favoritos a arquivar em segundo plano
@@ -28,6 +29,7 @@ const state = {
   seen: new Set(), // IDs de albuns ja vistos na loja atual
   seenStore: null, // loja para a qual state.seen foi carregado
   seenAll: false, // true se a loja atual esta marcada como "Visto" por inteiro
+  visitedPages: { store: null, pages: new Set() }, // páginas da grade já abertas
   favSeen: new Set(), // chaves "store::id" ja vistas (para a aba Favoritos)
 };
 
@@ -67,7 +69,7 @@ function renderFavReport() {
   if (r.toFetch) parts.push(`buscando ${r.toFetch} preço(s)…`);
   if (r.covers) {
     parts.push(
-      `capas ${r.covers.cached}/${r.covers.total} no cache local` +
+      `imagens ${r.covers.cached}/${r.covers.total} no cache local` +
         (r.covers.missing ? ` (arquivando ${r.covers.missing})` : ' ✓')
     );
   }
@@ -284,6 +286,27 @@ function recordSeen(albums) {
   callQuiet(api.markSeen(state.store, ids), 'Marcar vistos').catch(() => {});
 }
 
+/**
+ * Marca a loja como "Visto/Atualizado" SOMENTE quando todas as páginas da grade
+ * principal já foram abertas nesta navegação (todos os álbuns foram vistos).
+ * Abrir uma única página nunca marca a loja inteira.
+ */
+function markStoreSeenIfAllPagesVisited(store, page, totalPages) {
+  if (!store) return;
+  if (state.visitedPages.store !== store) {
+    state.visitedPages = { store, pages: new Set() };
+  }
+  const p = Number(page) || 1;
+  const total = Number(totalPages) || 1;
+  state.visitedPages.pages.add(p);
+  // Só conta como "tudo visto" quando cada página de 1..total foi aberta.
+  for (let i = 1; i <= total; i++) {
+    if (!state.visitedPages.pages.has(i)) return;
+  }
+  state.seenAll = true;
+  callQuiet(api.setPricedFlag(store, 'seen', true), 'Atualizado').catch(() => {});
+}
+
 async function loadAlbums(page) {
   if (!state.store) return setStatus('Carregue uma loja primeiro.', true);
   const data = await call(api.listAlbums(state.store, page), 'Albuns');
@@ -295,6 +318,10 @@ async function loadAlbums(page) {
   updateCrumbs();
   renderGrid(data.albums, '#albumGrid');
   recordSeen(data.albums);
+  // Só marca a loja como "Visto/Atualizado" quando TODAS as páginas da grade
+  // principal já foram abertas (ou seja, todos os álbuns foram vistos) — nunca
+  // ao abrir uma única página.
+  markStoreSeenIfAllPagesVisited(state.store, data.page, data.totalPages);
   renderPager();
   maybeCheckLinks();
 }
@@ -843,6 +870,8 @@ async function renderFavorites() {
     call(api.listFavorites(), 'Favoritos'),
     call(api.listTags(), 'Tags').catch(() => []),
   ]);
+  // Reset de página ao recarregar favoritos do zero
+  state.favPage = 1;
   state.favKeys = new Set(favs.map((f) => favKey(f.store, f.albumId)));
   state.favList = favs;
   state.tags = tags || [];
@@ -965,6 +994,9 @@ function favCardHtml(f) {
               data-fav-open-store="${esc(f.store)}">Abrir</button>
             <button class="btn small danger" data-fav-remove="${esc(f.albumId)}"
               data-fav-remove-store="${esc(f.store)}">Remover</button>
+            <button class="btn small" data-fav-refresh-price="${esc(favKey(f.store, f.albumId))}"
+              data-fav-refresh-link="${esc((f.externalLinks || [])[0] || '')}"
+              title="Re-buscar preço no site (Superbuy para Weidian)">↻ Preço</button>
             <input class="profit-inp hidden" type="number" min="0" step="1"
               placeholder="% deste" data-profit-input="${esc(favKey(f.store, f.albumId))}"
               title="Lucro só deste produto (prioridade sobre o global)" />
@@ -981,10 +1013,14 @@ function updateSelCount() {
 
 /** Renderiza a grade de favoritos aplicando o filtro de tags. */
 async function renderFavGrid() {
+  const FAV_PER_PAGE = 120;
   const grid = $('#favGrid');
+  const pager = $('#favPager');
   const favs = state.favList;
   if (!favs.length) {
     grid.innerHTML = '<div class="empty">Nenhum favorito arquivado ainda.</div>';
+    if (pager) pager.innerHTML = '';
+    setCacheStatus('0 favoritos');
     return;
   }
   // Filtro: mostra favoritos que tenham QUALQUER uma das tags selecionadas.
@@ -994,18 +1030,39 @@ async function renderFavGrid() {
     : favs;
   if (!visible.length) {
     grid.innerHTML = '<div class="empty">Nenhum favorito com as tags selecionadas.</div>';
+    if (pager) pager.innerHTML = '';
+    setCacheStatus(`${favs.length} favoritos (nenhum com as tags selecionadas)`);
     return;
   }
-  grid.innerHTML = visible.map(favCardHtml).join('');
+
+  // Paginação: limita quantos cards são renderizados de uma vez
+  const totalFavPages = Math.ceil(visible.length / FAV_PER_PAGE);
+  if (state.favPage < 1) state.favPage = 1;
+  if (state.favPage > totalFavPages) state.favPage = totalFavPages;
+  const pageStart = (state.favPage - 1) * FAV_PER_PAGE;
+  const pageItems = visible.slice(pageStart, pageStart + FAV_PER_PAGE);
+
+  grid.innerHTML = pageItems.map(favCardHtml).join('');
+  if (pager) {
+    if (totalFavPages > 1) {
+      const p = state.favPage;
+      pager.innerHTML = `
+        <button class="btn small" ${p <= 1 ? 'disabled' : ''} id="favPrev">‹ Anterior</button>
+        <span>Página <b>${p}</b> de ${totalFavPages} &nbsp;(${visible.length} favoritos)</span>
+        <button class="btn small" ${p >= totalFavPages ? 'disabled' : ''} id="favNext">Próxima ›</button>`;
+      $('#favPrev') && $('#favPrev').addEventListener('click', () => { state.favPage--; renderFavGrid(); window.scrollTo(0,0); });
+      $('#favNext') && $('#favNext').addEventListener('click', () => { state.favPage++; renderFavGrid(); window.scrollTo(0,0); });
+    } else {
+      pager.innerHTML = '';
+    }
+  }
   trackImageProgress(grid);
-  // Guarda os favoritos visiveis para "Selecionar visiveis" e atualiza o contador.
-  state._visibleFavKeys = visible.map((f) => favKey(f.store, f.albumId));
+  // "Selecionar visíveis" = apenas os cards da página atual.
+  state._visibleFavKeys = pageItems.map((f) => favKey(f.store, f.albumId));
   updateSelCount();
-  // Preços pelo NOME do álbum (fallback quando não há link de loja).
-  // Só calcula os que ainda NÃO estão no cache em memória — evita refazer o
-  // trabalho dos 2k+ favoritos toda vez que a aba é aberta. Roda sem travar a tela.
+  // Preços pelo NOME do álbum — só para os itens da página atual não cacheados.
   if (!state.titlePrices) state.titlePrices = {};
-  const needTitles = visible.filter((f) => !(favKey(f.store, f.albumId) in state.titlePrices));
+  const needTitles = pageItems.filter((f) => !(favKey(f.store, f.albumId) in state.titlePrices));
   if (needTitles.length) {
     try {
       const tp = await callQuiet(
@@ -1020,10 +1077,9 @@ async function renderFavGrid() {
     }
   }
 
-  // Preços automáticos nos favoritos (usa o primeiro link de cada favorito).
+  // Preços automáticos — só para os itens da página atual.
   const favLinks = [];
-  // Carrega do disco os precos ja obtidos, para exibir na hora sem rebuscar.
-  const allFavLinks = visible.map((f) => (f.externalLinks || [])[0]).filter(Boolean);
+  const allFavLinks = pageItems.map((f) => (f.externalLinks || [])[0]).filter(Boolean);
   let storedCount = 0;
   if (allFavLinks.length) {
     try {
@@ -1040,10 +1096,10 @@ async function renderFavGrid() {
   // Conta quantas imagens usam o cache local (ycimg://).
   const imgs = $('#favGrid').querySelectorAll('img[src^="ycimg://"]');
   const relatorio =
-    `[favoritos] ${visible.length} favoritos | ${allFavLinks.length} com link | ` +
-    `${storedCount} preços vindos do disco (cache) | ${imgs.length} imagens via cache local`;
+    `[favoritos] pág ${state.favPage}: ${pageItems.length}/${visible.length} | ${allFavLinks.length} com link | ` +
+    `${storedCount} preços no cache | ${imgs.length} imgs via cache local`;
   console.log(relatorio);
-  api.log(relatorio); // também aparece no terminal do Electron
+  api.log(relatorio);
 
   // Relatório visível no app (barra fixa no topo dos Favoritos).
   state._favReport = {
@@ -1055,22 +1111,24 @@ async function renderFavGrid() {
   };
   renderFavReport();
 
-  // Pré-cache em segundo plano de TODAS as capas dos favoritos (não só as que
-  // aparecem na tela), para tudo ficar arquivado sem precisar rolar a lista.
-  // Chamado a cada render (é idempotente: o main só baixa o que falta e mostra
-  // o relatório de quantas capas já estão no cache local, visível no app).
-  const allCovers = [...new Set(favs.map((f) => f.cover).filter(Boolean))];
+  // Pré-cache só das capas da página atual (não todas as 16k de uma vez).
+  const allImgs = new Set();
+  for (const f of pageItems) {
+    const thumb = f.cover || (f.photos && f.photos[0] && (f.photos[0].thumb || f.photos[0].big));
+    if (thumb) allImgs.add(thumb);
+  }
+  const allCovers = [...allImgs];
   if (allCovers.length) {
     Promise.resolve(api.prefetchImages(allCovers))
       .then((r) => {
         if (!r || !state._favReport) return;
         state._favReport.covers = { cached: r.cached, total: r.total, missing: r.missing };
         renderFavReport();
-        api.log(`[cache] capas ${r.cached}/${r.total} no cache local (faltando ${r.missing})`);
+        api.log(`[cache] imagens ${r.cached}/${r.total} no cache local (faltando ${r.missing})`);
       })
       .catch(() => {});
   }
-  visible.forEach((f) => {
+  pageItems.forEach((f) => {
     const key = favKey(f.store, f.albumId);
     const link = (f.externalLinks || [])[0];
     const el = document.querySelector(`[data-price-album="${CSS.escape(key)}"]`);
@@ -1086,7 +1144,6 @@ async function renderFavGrid() {
         favLinks.push(link);
       }
     } else if (state.titlePrices[key]) {
-      // Sem link: usa o preço detectado no nome do álbum.
       const tp = state.titlePrices[key];
       state.prices[tp.url] = tp;
       el.dataset.link = tp.url;
@@ -1116,6 +1173,31 @@ async function renderFavGrid() {
       renderFavReport();
     }
   }
+
+  // Sweep Superbuy em segundo plano: itens da página atual ainda sem preço válido.
+  // Roda sem bloquear a tela; para Weidian vai via Superbuy automaticamente.
+  Promise.resolve().then(async () => {
+    const noPrice = pageItems
+      .map((f) => (f.externalLinks || [])[0])
+      .filter((link) => link && (!state.prices[link] || !state.prices[link].ok));
+    if (!noPrice.length) return;
+    const uniq = [...new Set(noPrice)];
+    console.log(`[sweep] ${uniq.length} item(ns) sem preço → Superbuy`);
+    api.log(`[sweep] ${uniq.length} itens sem preço → tentando Superbuy`);
+    try {
+      const r = await api.forceRefetchPrices(uniq);
+      let found = 0;
+      (r && r.results || []).forEach((item) => {
+        if (!item || !item.url) return;
+        state.prices[item.url] = item;
+        updateAlbumPrice(item.url);
+        if (item.ok) found++;
+      });
+      if (found) api.log(`[sweep] encontrou preço em ${found} item(ns) via Superbuy`);
+    } catch (e) {
+      console.warn('[sweep]', e.message);
+    }
+  }).catch(() => {});
 }
 
 /* ------------------ Links de compra por site (permanente) ----------------- */
@@ -1290,10 +1372,14 @@ async function renderPricedStores() {
   ul.innerHTML = list
     .map((s) => {
       const host = s.store.replace(/^https?:\/\//, '');
+      const newBadge = s.newCount
+        ? `<span class="store-new" title="Álbuns novos ainda não vistos">● ${s.newCount} novo(s)</span>`
+        : '';
       return `<li class="store-block">
         <div class="store-head">
           <a href="#" data-open-store="${esc(s.store)}" class="store-url">${esc(host)}</a>
           <span class="store-count">✓ ${s.priced} link(s) de loja</span>
+          ${newBadge}
           <button class="btn small chk ${s.seen ? 'on' : ''}" data-priced-flag="seen"
             data-priced-store="${esc(s.store)}">${s.seen ? '✓ ' : ''}Visto</button>
           <button class="btn small chk ${s.reviewed ? 'on' : ''}" data-priced-flag="reviewed"
@@ -1360,6 +1446,40 @@ async function runVerify() {
     state.verify.running = false;
     if (btn) btn.disabled = false;
     renderVerifyResults();
+    renderPricedStores();
+  }
+}
+
+/**
+ * Varre a grade principal (todas as páginas) de cada loja salva procurando
+ * álbuns novos ainda não vistos. Lojas com novos perdem o "Atualizado"; lojas
+ * sem novos ficam marcadas como "Atualizado". Acompanha o progresso na barra.
+ */
+async function runCheckNew() {
+  const btn = $('#checkNewRun');
+  if (btn) btn.disabled = true;
+  setStatus('Verificando álbuns novos nas lojas salvas…');
+  let withNew = 0;
+  const off = api.onCheckNewProgress((p) => {
+    if (!p) return;
+    if (p.entry && p.entry.newCount) withNew += 1;
+    const host = (p.store || '').replace(/^https?:\/\//, '');
+    setStatus(`Verificando novos: ${p.done}/${p.total} — ${host}`);
+    renderPricedStores();
+  });
+  try {
+    const r = await call(api.checkNewStores(), 'Verificar álbuns novos');
+    const comNovos = (r.results || []).filter((x) => x.newCount > 0).length;
+    setStatus(
+      `Verificação concluída: ${comNovos} loja(s) com álbuns novos de ${
+        (r.results || []).length
+      } verificada(s).`
+    );
+  } catch (err) {
+    setStatus('Erro ao verificar álbuns novos: ' + err.message, true);
+  } finally {
+    if (typeof off === 'function') off();
+    if (btn) btn.disabled = false;
     renderPricedStores();
   }
 }
@@ -1536,6 +1656,8 @@ function bindEvents() {
 
   const verifyBtn = $('#verifyRun');
   if (verifyBtn) verifyBtn.addEventListener('click', runVerify);
+  const checkNewBtn = $('#checkNewRun');
+  if (checkNewBtn) checkNewBtn.addEventListener('click', runCheckNew);
   const verifyClear = $('#verifyClear');
   if (verifyClear)
     verifyClear.addEventListener('click', () => {
@@ -1586,7 +1708,7 @@ function bindEvents() {
 
   // Delegacao de cliques no corpo principal
   document.body.addEventListener('click', async (e) => {
-    const t = e.target.closest('[data-open],[data-fav],[data-page],[data-cat-page],[data-goto],[data-cat],[data-ext],[data-copy],[data-fav-open],[data-fav-remove],[data-store-remove],[data-store-toggle],[data-open-store],[data-priced-remove],[data-priced-flag],[data-close],[data-tag-filter],[data-tag-del],[data-tag-clear],[data-untag]');
+    const t = e.target.closest('[data-open],[data-fav],[data-page],[data-cat-page],[data-goto],[data-cat],[data-ext],[data-copy],[data-fav-open],[data-fav-remove],[data-fav-refresh-price],[data-store-remove],[data-store-toggle],[data-open-store],[data-priced-remove],[data-priced-flag],[data-close],[data-tag-filter],[data-tag-del],[data-tag-clear],[data-untag]');
     if (!t) return;
 
     if (t.dataset.close !== undefined) {
@@ -1641,6 +1763,30 @@ function bindEvents() {
         setStatus('Falha ao remover favorito.', true);
         renderFavorites(); // recarrega para restaurar em caso de erro
       });
+    } else if (t.dataset.favRefreshPrice !== undefined) {
+      // Botão ↻ Preço: força re-busca (apaga cache de falha e re-raspa).
+      e.preventDefault();
+      const link = t.dataset.favRefreshLink;
+      const key = t.dataset.favRefreshPrice;
+      const priceEl = document.querySelector(`[data-price-album="${CSS.escape(key)}"]`);
+      if (priceEl) {
+        priceEl.className = 'price-badge loading';
+        priceEl.textContent = '↻';
+      }
+      if (!link) {
+        if (priceEl) { priceEl.className = 'price-badge fail'; priceEl.textContent = '—'; }
+        return;
+      }
+      try {
+        const r = await callQuiet(api.forceRefetchPrices([link]), 'Atualizar preço');
+        const item = (r && r.results || []).find((x) => x && x.url === link);
+        if (item) {
+          state.prices[link] = item;
+          updateAlbumPrice(link);
+        }
+      } catch (_) {
+        if (priceEl) { priceEl.className = 'price-badge fail'; priceEl.textContent = '—'; }
+      }
     } else if (t.dataset.storeRemove) {
       e.preventDefault();
       await call(api.removeStoreLinks(t.dataset.storeRemove), 'Remover site');
@@ -1667,6 +1813,7 @@ function bindEvents() {
       const name = t.dataset.tagFilter;
       if (state.tagFilter.has(name)) state.tagFilter.delete(name);
       else state.tagFilter.add(name);
+      state.favPage = 1;
       renderTagBar();
       renderFavGrid();
     } else if (t.dataset.tagDel !== undefined) {
