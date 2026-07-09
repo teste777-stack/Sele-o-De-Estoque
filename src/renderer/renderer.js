@@ -8,6 +8,7 @@ const state = {
   store: '',
   view: 'albums',
   albumsPage: 1,
+  albumsLoading: false,
   albumsTotalPages: 1,
   currentAlbums: [], // albuns exibidos na grade atual
   currentCategory: null, // { id, name } quando navegando por categoria
@@ -309,36 +310,61 @@ function markStoreSeenIfAllPagesVisited(store, page, totalPages) {
 
 async function loadAlbums(page) {
   if (!state.store) return setStatus('Carregue uma loja primeiro.', true);
-  const data = await call(api.listAlbums(state.store, page), 'Albuns');
-  state.currentAlbums = data.albums;
-  state.albumsPage = data.page;
-  state.albumsTotalPages = data.totalPages;
-  state.currentCategory = null;
-  await ensureSeenLoaded();
-  updateCrumbs();
-  renderGrid(data.albums, '#albumGrid');
-  recordSeen(data.albums);
-  // Só marca a loja como "Visto/Atualizado" quando TODAS as páginas da grade
-  // principal já foram abertas (ou seja, todos os álbuns foram vistos) — nunca
-  // ao abrir uma única página.
-  markStoreSeenIfAllPagesVisited(state.store, data.page, data.totalPages);
-  renderPager();
-  maybeCheckLinks();
+  if (state.albumsLoading) return;
+  state.albumsLoading = true;
+  try {
+    const data = await call(api.listAlbums(state.store, page), 'Albuns');
+    if (page === 1) {
+      state.currentAlbums = data.albums;
+      state.currentCategory = null;
+    } else {
+      state.currentAlbums = [...(state.currentAlbums || []), ...data.albums];
+    }
+    state.albumsPage = data.page;
+    state.albumsTotalPages = data.totalPages;
+    if (page === 1) {
+      await ensureSeenLoaded();
+      updateCrumbs();
+      renderGrid(data.albums, '#albumGrid');
+    } else {
+      appendGrid(data.albums, '#albumGrid');
+    }
+    recordSeen(data.albums);
+    markStoreSeenIfAllPagesVisited(state.store, data.page, data.totalPages);
+    updateScrollSentinel();
+    maybeCheckLinks(data.albums);
+  } finally {
+    state.albumsLoading = false;
+  }
 }
 
 async function loadCategoryAlbums(catId, catName, page) {
-  const data = await call(api.categoryAlbums(state.store, catId, page), 'Categoria');
-  state.currentAlbums = data.albums;
-  state.albumsPage = data.page;
-  state.albumsTotalPages = data.totalPages;
-  state.currentCategory = data.category || { id: catId, name: catName };
-  switchView('albums');
-  await ensureSeenLoaded();
-  updateCrumbs();
-  renderGrid(data.albums, '#albumGrid');
-  recordSeen(data.albums);
-  renderPager();
-  maybeCheckLinks();
+  if (state.albumsLoading) return;
+  state.albumsLoading = true;
+  try {
+    const data = await call(api.categoryAlbums(state.store, catId, page), 'Categoria');
+    if (page === 1) {
+      state.currentAlbums = data.albums;
+    } else {
+      state.currentAlbums = [...(state.currentAlbums || []), ...data.albums];
+    }
+    state.albumsPage = data.page;
+    state.albumsTotalPages = data.totalPages;
+    state.currentCategory = data.category || { id: catId, name: catName };
+    if (page === 1) {
+      switchView('albums');
+      await ensureSeenLoaded();
+      updateCrumbs();
+      renderGrid(data.albums, '#albumGrid');
+    } else {
+      appendGrid(data.albums, '#albumGrid');
+    }
+    recordSeen(data.albums);
+    updateScrollSentinel();
+    maybeCheckLinks(data.albums);
+  } finally {
+    state.albumsLoading = false;
+  }
 }
 
 function updateCrumbs() {
@@ -399,56 +425,58 @@ function renderGrid(albums, target) {
   }
   grid.innerHTML = albums.map(albumCardHtml).join('');
   trackImageProgress(grid);
-  // Arquiva no disco TODAS as capas desta página (não só as visíveis por causa
-  // do loading="lazy"), para tudo que foi visitado ficar salvo de uma vez e não
-  // precisar rebaixar na próxima visita.
   const covers = [...new Set(albums.map((a) => a.cover).filter(Boolean))];
-  if (covers.length) {
-    Promise.resolve(api.prefetchImages(covers)).catch(() => {});
-  }
+  if (covers.length) Promise.resolve(api.prefetchImages(covers)).catch(() => {});
+  setupAlbumScrollObserver();
 }
 
-function renderPager() {
-  const pager = $('#albumPager');
-  const { albumsPage: p, albumsTotalPages: total } = state;
-  if (total <= 1) {
-    pager.innerHTML = '';
-    return;
-  }
-  const go = (n) => (state.currentCategory
-    ? `data-cat-page="${n}"`
-    : `data-page="${n}"`);
-  pager.innerHTML = `
-    <button class="btn small" ${p <= 1 ? 'disabled' : ''} ${go(p - 1)}>‹ Anterior</button>
-    <span>Página <b>${p}</b> de ${total}</span>
-    <button class="btn small" ${p >= total ? 'disabled' : ''} ${go(p + 1)}>Próxima ›</button>
-    <span class="pager-goto">
-      Ir para
-      <input id="gotoPage" type="number" min="1" max="${total}" value="${p}" class="goto-input" />
-      <button class="btn small" data-goto>Ir</button>
-    </span>`;
+function appendGrid(albums, target) {
+  const grid = $(target);
+  if (!albums || !albums.length) return;
+  const tmp = document.createElement('div');
+  tmp.innerHTML = albums.map(albumCardHtml).join('');
+  while (tmp.firstChild) grid.appendChild(tmp.firstChild);
+  trackImageProgress(grid);
+  const covers = [...new Set(albums.map((a) => a.cover).filter(Boolean))];
+  if (covers.length) Promise.resolve(api.prefetchImages(covers)).catch(() => {});
 }
 
-/** Vai para a página digitada no campo, respeitando o intervalo válido. */
-function goToPage() {
-  const inp = $('#gotoPage');
-  if (!inp) return;
-  let n = parseInt(inp.value, 10);
-  const total = state.albumsTotalPages;
-  if (!Number.isFinite(n)) return;
-  n = Math.min(Math.max(1, n), total);
-  if (n === state.albumsPage) return;
-  if (state.currentCategory) {
-    loadCategoryAlbums(state.currentCategory.id, state.currentCategory.name, n);
-  } else {
-    loadAlbums(n);
-  }
+/** Mostra/oculta o sentinel de scroll infinito conforme se há mais páginas. */
+function updateScrollSentinel() {
+  const s = $('#albumScrollSentinel');
+  if (!s) return;
+  const hasMore = state.albumsPage < state.albumsTotalPages;
+  s.className = hasMore ? 'scroll-sentinel loading' : 'scroll-sentinel done';
+  s.textContent = hasMore ? 'Carregando mais…' : '';
+}
+
+let _albumObserver = null;
+function setupAlbumScrollObserver() {
+  if (_albumObserver) { _albumObserver.disconnect(); _albumObserver = null; }
+  const sentinel = $('#albumScrollSentinel');
+  if (!sentinel) return;
+  _albumObserver = new IntersectionObserver(
+    (entries) => {
+      if (!entries[0].isIntersecting) return;
+      if (state.albumsLoading) return;
+      if (state.albumsPage >= state.albumsTotalPages) return;
+      const next = state.albumsPage + 1;
+      if (state.currentCategory) {
+        loadCategoryAlbums(state.currentCategory.id, state.currentCategory.name, next);
+      } else {
+        loadAlbums(next);
+      }
+    },
+    { rootMargin: '400px' }
+  );
+  _albumObserver.observe(sentinel);
 }
 
 /* -------------------- Verificacao de links + precos (badges) -------------- */
-async function maybeCheckLinks() {
+async function maybeCheckLinks(albums) {
   if (!$('#checkLinksToggle').checked) return;
-  const ids = state.currentAlbums.map((a) => a.id);
+  const batch = albums || state.currentAlbums;
+  const ids = batch.map((a) => a.id);
   if (!ids.length) return;
   setStatus('Verificando links dos álbuns...');
   let map;
@@ -465,13 +493,14 @@ async function maybeCheckLinks() {
   try {
     const tp = await call(
       api.pricesFromTitles(
-        state.currentAlbums.map((a) => ({ id: a.id, title: a.title, url: a.url }))
+        batch.map((a) => ({ id: a.id, title: a.title, url: a.url }))
       ),
       'Preços pelo nome'
     );
-    state.titlePrices = tp || {};
+    if (!state.titlePrices) state.titlePrices = {};
+    Object.assign(state.titlePrices, tp || {});
   } catch (_) {
-    state.titlePrices = {};
+    if (!state.titlePrices) state.titlePrices = {};
   }
 
   const priceLinks = [];
@@ -1491,13 +1520,6 @@ function bindEvents() {
     if (e.key === 'Enter') loadStore();
   });
 
-  // Enter no campo "Ir para" navega para a página digitada.
-  document.body.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && e.target && e.target.id === 'gotoPage') {
-      e.preventDefault();
-      goToPage();
-    }
-  });
 
   $$('.tab').forEach((t) =>
     t.addEventListener('click', () => switchView(t.dataset.view))
@@ -1708,7 +1730,7 @@ function bindEvents() {
 
   // Delegacao de cliques no corpo principal
   document.body.addEventListener('click', async (e) => {
-    const t = e.target.closest('[data-open],[data-fav],[data-page],[data-cat-page],[data-goto],[data-cat],[data-ext],[data-copy],[data-fav-open],[data-fav-remove],[data-fav-refresh-price],[data-store-remove],[data-store-toggle],[data-open-store],[data-priced-remove],[data-priced-flag],[data-close],[data-tag-filter],[data-tag-del],[data-tag-clear],[data-untag]');
+    const t = e.target.closest('[data-open],[data-fav],[data-cat],[data-ext],[data-copy],[data-fav-open],[data-fav-remove],[data-fav-refresh-price],[data-store-remove],[data-store-toggle],[data-open-store],[data-priced-remove],[data-priced-flag],[data-close],[data-tag-filter],[data-tag-del],[data-tag-clear],[data-untag]');
     if (!t) return;
 
     if (t.dataset.close !== undefined) {
@@ -1721,18 +1743,6 @@ function bindEvents() {
     } else if (t.dataset.fav) {
       e.preventDefault();
       quickFavorite(t.dataset.fav);
-    } else if (t.dataset.page) {
-      loadAlbums(parseInt(t.dataset.page, 10));
-    } else if (t.dataset.catPage) {
-      loadCategoryAlbums(
-        state.currentCategory.id,
-        state.currentCategory.name,
-        parseInt(t.dataset.catPage, 10)
-      );
-    } else if (t.dataset.goto !== undefined) {
-      // Ir para a página digitada (limitada ao intervalo válido).
-      e.preventDefault();
-      goToPage();
     } else if (t.dataset.cat) {
       loadCategoryAlbums(t.dataset.cat, t.dataset.name, 1);
     } else if (t.dataset.ext) {
